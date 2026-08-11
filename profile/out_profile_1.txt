@@ -1,0 +1,14 @@
+OMP_NUM_THREADS=1 python profile/profile_demucs.py --device cpu --flops > profile/out.txt
+
+# Single sample
+
+Loading model 'htdemucs' ...
+sources=['drums', 'bass', 'other', 'vocals']  samplerate=44100  channels=2  submodels=1
+  submodel[0] params=41.98M  segment=39/5
+TOTAL params=41.98M  weight memory(fp32)=167.94MB  (int8=41.98MB)
+
+Timing one submodel forward on 7.800s @ cpu (input (1, 2, 343980)) ...
+  per-forward: 4417.3 ms  |  real-time factor: 0.57x (faster than real-time, one submodel)
+  full bag (~1x) est: 4417.3 ms -> RTF 0.57x
+
+FLOPs (thop, one submodel, 7.800s): 260.61G  (MACs=130.30G)

@@ -1,0 +1,25 @@
+OMP_NUM_THREADS=1 python profile/profile_demucs.py --device cpu --flops --track-seconds 60 > profile/out.txt 2>&1
+
+# Better run command, uses longer window
+Tracking mem usage too, peak was 1.4 GB
+
+peak RSS at start: 301 MB
+Loading model 'htdemucs' ...
+sources=['drums', 'bass', 'other', 'vocals']  samplerate=44100  channels=2  submodels=1
+  submodel[0] params=41.98M  segment=39/5
+TOTAL params=41.98M  weight memory(fp32)=167.94MB  (int8=41.98MB)
+peak RSS after load: 549 MB
+
+Timing one submodel forward on 7.800s @ cpu (input (1, 2, 343980)) ...
+  per-forward: 4863.2 ms  |  real-time factor: 0.62x (faster than real-time, one submodel)
+  full bag (~1x) est: 4863.2 ms -> RTF 0.62x
+  peak RSS after single forward: 1255 MB
+
+FLOPs (thop, one submodel, 7.800s): 260.61G  (MACs=130.30G)
+
+=== full apply_model on 60.0s track (shifts=1, overlap=0.25) ===
+  window=7.80s  stride=5.85s  windows/pass=11  passes=1  submodels=1  -> total window-forwards=11
+  wall-clock: 50.0s for 60.0s audio -> RTF 0.83x (faster than real-time)
+  peak RSS during full run: 1394 MB
+  full-track output buffer (sources*ch*len*fp32): 81 MB (grows with track length -- a streaming impl would NOT hold this)
+  aggregate compute: 1.43TMAC total  |  23.89GMAC per second of audio (divide a device's MAC/s into this for a real-time verdict)
