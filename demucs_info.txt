@@ -1,0 +1,28 @@
+Paper is at: https://arxiv.org/pdf/2211.08553
+
+Main entrypoint is separate.py in demucs/
+
+Only args passed in are `-n htdemucs --mp3 -o ...`
+
+Default model args in `api.py` Separator class
+
+Model args:
+ shifts: 1
+    - make a random shift in audio shifts times, then average output
+    - 0.25 DB boost
+ overlap: 0.25
+ split: true
+Default segment length is 10 seconds from htdemucs.py:131
+ - right pad w/ 0 at inference, htdmeucs.py:530-537
+
+separate.py defaults
+    samplerate 44.1KHz
+    bitrate 320 kbps mp3
+    16 bits per sample
+    high quality encoding LAME 
+
+mp3 input as file path
+api.py -> separate_audio_file 
+calls separate_tensor on _load_audio
+weighted label is used, output is most accurate in middle of window
+ - middle peak is segment samples // 2, 220K for this
