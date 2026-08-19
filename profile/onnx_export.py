@@ -1,0 +1,288 @@
+"""Export the htdemucs *core* (encoder/transformer/decoder) to ONNX and verify.
+
+Why only the core: htdemucs' forward starts with an STFT (complex tensor) and
+ends with complex masking + iSTFT. ONNX has no complex dtype, so the whole model
+can't be exported directly. But all of the *compute* (the conv encoder, the
+cross-transformer, the conv decoder -- ~all 130 GMAC) is plain real-valued math.
+So we export just that middle, and keep the cheap STFT/iSTFT/normalization in
+torch. The core takes two normalized real tensors (freq branch `x`, time branch
+`xt`) and returns two real tensors, exactly matching htdemucs.forward lines
+561-623 in vendor/demucs/htdemucs.py.
+
+Usage (run in your WSL env that already has torch + demucs working):
+    pip install onnx onnxruntime            # onnxruntime-tools optional
+    python profile/onnx_export.py --export   -o profile/htdemucs_core.onnx
+    python profile/onnx_export.py --verify   -o profile/htdemucs_core.onnx
+
+--export writes the .onnx (do this on the fast box, e.g. the 7600x).
+--verify runs ORT vs torch on a random segment and prints max abs error.
+Then scp the .onnx to the Pi and run ORT there.
+"""
+
+import argparse
+import math
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "vendor"))
+
+import torch as th
+import torch.nn as nn
+from einops import rearrange
+
+from demucs.pretrained import get_model
+from demucs.apply import BagOfModels
+
+
+def get_htdemucs(name="htdemucs"):
+    model = get_model(name)
+    m = model.models[0] if isinstance(model, BagOfModels) else model
+    m.eval()
+    return m
+
+
+class Core(nn.Module):
+    """The real-valued middle of htdemucs.forward.
+
+    forward(x, xt): x is the normalized magnitude (freq branch), xt is the
+    normalized time-domain mix. Returns (x, xt) raw core outputs, before the
+    view/denormalize/mask/ispec steps that stay in torch outside ONNX.
+
+    This mirrors vendor/demucs/htdemucs.py forward() lines 561-623 exactly.
+    """
+
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, x, xt):
+        m = self.m
+        saved = []
+        saved_t = []
+        lengths = []
+        lengths_t = []
+        for idx, encode in enumerate(m.encoder):
+            lengths.append(x.shape[-1])
+            inject = None
+            if idx < len(m.tencoder):
+                lengths_t.append(xt.shape[-1])
+                tenc = m.tencoder[idx]
+                xt = tenc(xt)
+                if not tenc.empty:
+                    saved_t.append(xt)
+                else:
+                    inject = xt
+            x = encode(x, inject)
+            if idx == 0 and m.freq_emb is not None:
+                frs = th.arange(x.shape[-2], device=x.device)
+                emb = m.freq_emb(frs).t()[None, :, :, None].expand_as(x)
+                x = x + m.freq_emb_scale * emb
+            saved.append(x)
+
+        if m.crosstransformer:
+            if m.bottom_channels:
+                b, c, f, t = x.shape
+                x = rearrange(x, "b c f t-> b c (f t)")
+                x = m.channel_upsampler(x)
+                x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                xt = m.channel_upsampler_t(xt)
+
+            x, xt = m.crosstransformer(x, xt)
+
+            if m.bottom_channels:
+                x = rearrange(x, "b c f t-> b c (f t)")
+                x = m.channel_downsampler(x)
+                x = rearrange(x, "b c (f t)-> b c f t", f=f)
+                xt = m.channel_downsampler_t(xt)
+
+        for idx, decode in enumerate(m.decoder):
+            skip = saved.pop(-1)
+            x, pre = decode(x, skip, lengths.pop(-1))
+            offset = m.depth - len(m.tdecoder)
+            if idx >= offset:
+                tdec = m.tdecoder[idx - offset]
+                length_t = lengths_t.pop(-1)
+                if tdec.empty:
+                    pre = pre[:, :, 0]
+                    xt, _ = tdec(pre, None, length_t)
+                else:
+                    skip = saved_t.pop(-1)
+                    xt, _ = tdec(xt, skip, length_t)
+
+        return x, xt
+
+
+def make_core_inputs(m, seconds=None, device="cpu"):
+    """Build the two normalized real inputs the Core consumes, plus the
+    surrounding tensors (z, means/stds) needed to reconstruct the output."""
+    sr = m.samplerate
+    ch = m.audio_channels
+    training_length = int(m.segment * sr)
+    n = training_length if seconds is None else int(seconds * sr)
+    mix = th.randn(1, ch, n, device=device)
+    if n < training_length:
+        mix = th.nn.functional.pad(mix, (0, training_length - n))
+
+    z = m._spec(mix)
+    mag = m._magnitude(z).to(mix.device)
+    x = mag
+    mean = x.mean(dim=(1, 2, 3), keepdim=True)
+    std = x.std(dim=(1, 2, 3), keepdim=True)
+    x = (x - mean) / (1e-5 + std)
+
+    xt = mix
+    meant = xt.mean(dim=(1, 2), keepdim=True)
+    stdt = xt.std(dim=(1, 2), keepdim=True)
+    xt = (xt - meant) / (1e-5 + stdt)
+    return dict(
+        x=x,
+        xt=xt,
+        z=z,
+        mix=mix,
+        mean=mean,
+        std=std,
+        meant=meant,
+        stdt=stdt,
+        training_length=training_length,
+    )
+
+
+def reconstruct(m, core_x, core_xt, ctx):
+    """Torch tail: denormalize, mask, iSTFT, add time branch. Mirrors
+    htdemucs.forward lines 624-660 (non-mps, use_train_segment eval path)."""
+    B = ctx["x"].shape[0]
+    Fq = ctx["x"].shape[2]
+    T = ctx["x"].shape[3]
+    S = len(m.sources)
+    x = core_x.view(B, S, -1, Fq, T)
+    x = x * ctx["std"][:, None] + ctx["mean"][:, None]
+    zout = m._mask(ctx["z"], x)
+    x = m._ispec(zout, ctx["training_length"])
+
+    xt = core_xt.view(B, S, -1, ctx["training_length"])
+    xt = xt * ctx["stdt"][:, None] + ctx["meant"][:, None]
+    return xt + x
+
+
+def _patch_unflatten():
+    """torch 2.0.1's ONNX exporter has no symbolic for aten::unflatten (used in
+    the decomposed MHA path). Replace it with an equivalent reshape, which the
+    exporter supports. Traced with static shapes so it's exact. Returns the
+    original for restoration."""
+    orig = th.Tensor.unflatten
+
+    def _unflatten(self, dim, sizes):
+        if dim < 0:
+            dim += self.dim()
+        shape = list(self.shape)
+        new_shape = shape[:dim] + list(sizes) + shape[dim + 1 :]
+        return self.reshape(new_shape)
+
+    th.Tensor.unflatten = _unflatten
+    return orig
+
+
+def _patch_sdpa():
+    """torch 2.0.1's exporter can't lower the fused
+    aten::scaled_dot_product_attention. Replace it with the plain-math
+    equivalent (matmul + softmax + matmul), which exports cleanly. eval() means
+    dropout_p is 0. Returns the original for restoration."""
+    import torch.nn.functional as F
+
+    orig = F.scaled_dot_product_attention
+
+    def _sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+    ):
+        scale_factor = 1.0 / math.sqrt(query.size(-1)) if scale is None else scale
+        attn = (query @ key.transpose(-2, -1)) * scale_factor
+        if attn_mask is not None:
+            if attn_mask.dtype == th.bool:
+                attn = attn.masked_fill(~attn_mask, float("-inf"))
+            else:
+                attn = attn + attn_mask
+        attn = attn.softmax(dim=-1)
+        return attn @ value
+
+    F.scaled_dot_product_attention = _sdpa
+    return orig
+
+
+def cmd_export(args):
+    m = get_htdemucs(args.name)
+    core = Core(m).eval()
+    ctx = make_core_inputs(m)
+    orig_unflatten = _patch_unflatten()
+    orig_sdpa = _patch_sdpa()
+    # NOTE: do NOT wrap in th.no_grad(). nn.MultiheadAttention only falls back
+    # to the ONNX-exportable *decomposed* attention when grad is enabled and
+    # params require grad; under no_grad it uses the fused
+    # aten::_native_multi_head_attention kernel, which torch 2.0.1's exporter
+    # cannot lower. eval() (dropout off) + grad enabled is what we want here.
+    with th.enable_grad():
+        th.onnx.export(
+            core,
+            (ctx["x"], ctx["xt"]),
+            args.out,
+            input_names=["mag", "mix_t"],
+            output_names=["spec_out", "time_out"],
+            opset_version=args.opset,
+            do_constant_folding=True,
+        )
+    th.Tensor.unflatten = orig_unflatten
+    import torch.nn.functional as F
+
+    F.scaled_dot_product_attention = orig_sdpa
+    print(f"wrote {args.out}")
+    print("input shapes:", tuple(ctx["x"].shape), tuple(ctx["xt"].shape))
+
+
+def cmd_verify(args):
+    import numpy as np
+    import onnxruntime as ort
+
+    m = get_htdemucs(args.name)
+    ctx = make_core_inputs(m)
+
+    # torch reference: full forward on the same mix.
+    with th.no_grad():
+        ref = m(ctx["mix"])
+
+    # ORT core + torch tail.
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = args.threads
+    sess = ort.InferenceSession(args.out, so, providers=["CPUExecutionProvider"])
+    outs = sess.run(
+        ["spec_out", "time_out"],
+        {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()},
+    )
+    core_x = th.from_numpy(outs[0])
+    core_xt = th.from_numpy(outs[1])
+    with th.no_grad():
+        got = reconstruct(m, core_x, core_xt, ctx)
+
+    err = (got - ref).abs().max().item()
+    rel = err / (ref.abs().max().item() + 1e-9)
+    print(f"max abs err vs torch: {err:.3e}  (rel {rel:.3e})")
+    print("PASS" if err < 1e-3 else "CHECK: error larger than expected")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-n", "--name", default="htdemucs")
+    ap.add_argument("-o", "--out", default="profile/htdemucs_core.onnx")
+    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--threads", type=int, default=1)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--export", action="store_true")
+    g.add_argument("--verify", action="store_true")
+    args = ap.parse_args()
+    if args.export:
+        cmd_export(args)
+    else:
+        cmd_verify(args)
+
+
+if __name__ == "__main__":
+    main()
