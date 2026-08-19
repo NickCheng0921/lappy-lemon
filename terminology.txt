@@ -1,0 +1,11 @@
+GMAC - giga mac, 1 billion mac operations
+a += b * c
+summed over all ops in forward pass, scales w/ tensor size
+
+RTF - real time factor
+processing time / audio duration
+for each second of audio, how many seconds of compute to make it
+< 1 = real time
+
+RSS - resident set size
+physical RAM process occupies

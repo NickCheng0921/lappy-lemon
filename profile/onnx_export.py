@@ -113,16 +113,16 @@ class Core(nn.Module):
         return x, xt
 
 
-def make_core_inputs(m, seconds=None, device="cpu"):
-    """Build the two normalized real inputs the Core consumes, plus the
-    surrounding tensors (z, means/stds) needed to reconstruct the output."""
+def front(m, mix):
+    """Torch front end for one segment: pad to training length, STFT, magnitude,
+    normalize both branches. Returns the two normalized real Core inputs plus the
+    ctx tensors needed to reconstruct. Mirrors htdemucs.forward lines 528-554."""
     sr = m.samplerate
-    ch = m.audio_channels
     training_length = int(m.segment * sr)
-    n = training_length if seconds is None else int(seconds * sr)
-    mix = th.randn(1, ch, n, device=device)
-    if n < training_length:
-        mix = th.nn.functional.pad(mix, (0, training_length - n))
+    length_pre_pad = None
+    if mix.shape[-1] < training_length:
+        length_pre_pad = mix.shape[-1]
+        mix = th.nn.functional.pad(mix, (0, training_length - length_pre_pad))
 
     z = m._spec(mix)
     mag = m._magnitude(z).to(mix.device)
@@ -136,16 +136,19 @@ def make_core_inputs(m, seconds=None, device="cpu"):
     stdt = xt.std(dim=(1, 2), keepdim=True)
     xt = (xt - meant) / (1e-5 + stdt)
     return dict(
-        x=x,
-        xt=xt,
-        z=z,
-        mix=mix,
-        mean=mean,
-        std=std,
-        meant=meant,
-        stdt=stdt,
-        training_length=training_length,
+        x=x, xt=xt, z=z, mix=mix, mean=mean, std=std, meant=meant, stdt=stdt,
+        training_length=training_length, length_pre_pad=length_pre_pad,
     )
+
+
+def make_core_inputs(m, seconds=None, device="cpu"):
+    """Build Core inputs on a random segment (for --verify / --export shapes)."""
+    sr = m.samplerate
+    ch = m.audio_channels
+    training_length = int(m.segment * sr)
+    n = training_length if seconds is None else int(seconds * sr)
+    mix = th.randn(1, ch, n, device=device)
+    return front(m, mix)
 
 
 def reconstruct(m, core_x, core_xt, ctx):
@@ -162,7 +165,36 @@ def reconstruct(m, core_x, core_xt, ctx):
 
     xt = core_xt.view(B, S, -1, ctx["training_length"])
     xt = xt * ctx["stdt"][:, None] + ctx["meant"][:, None]
-    return xt + x
+    out = xt + x
+    if ctx["length_pre_pad"]:
+        out = out[..., : ctx["length_pre_pad"]]
+    return out
+
+
+class OrtCoreModel(nn.Module):
+    """A drop-in for htdemucs that runs the heavy core in ONNX Runtime while
+    keeping the STFT/iSTFT tail in torch. Exposes the attributes apply_model
+    needs (sources, samplerate, audio_channels, segment) so demucs' own
+    windowing/overlap pipeline can drive it unchanged."""
+
+    def __init__(self, m, sess):
+        super().__init__()
+        self.m = m
+        self.sess = sess
+        self.sources = m.sources
+        self.samplerate = m.samplerate
+        self.audio_channels = m.audio_channels
+        self.segment = m.segment
+
+    def forward(self, mix):
+        ctx = front(self.m, mix)
+        outs = self.sess.run(
+            ["spec_out", "time_out"],
+            {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()},
+        )
+        core_x = th.from_numpy(outs[0])
+        core_xt = th.from_numpy(outs[1])
+        return reconstruct(self.m, core_x, core_xt, ctx)
 
 
 def _patch_unflatten():
@@ -268,26 +300,60 @@ def cmd_verify(args):
     print("PASS" if err < 1e-3 else "CHECK: error larger than expected")
 
 
+def peak_rss_mb():
+    """Process-wide peak resident memory (high-water mark). Linux ru_maxrss is
+    in KB, macOS in bytes. None on Windows (no `resource` module)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return ru / (1024 * 1024) if sys.platform == "darwin" else ru / 1024
+
+
+def _fmt_mb(mb):
+    return "n/a (Windows)" if mb is None else f"{mb:.0f} MB"
+
+
+def make_session(args):
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = args.threads
+    if args.lean:
+        # Low-RAM path for the 4GB Pi. The arena + mem-pattern planner and
+        # ORT_ENABLE_ALL weight pre-packing can spike peak RSS well past the
+        # model size (we saw ~3.7GB -> OOM). These trade a little speed for a
+        # much lower memory ceiling.
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
+    else:
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(args.out, so, providers=["CPUExecutionProvider"])
+
+
 def cmd_bench(args):
     """Time the ORT core forward, framed like profile_demucs.py (per-forward ms +
     RTF on one 7.8s window). With --torch-baseline, also time the full torch
     forward on the same box for a same-machine ORT-vs-torch comparison."""
     import time
 
-    import onnxruntime as ort
+    import numpy as np
 
-    m = get_htdemucs(args.name)
-    ctx = make_core_inputs(m)
-    sr = m.samplerate
-    window_s = float(m.segment)
+    window_s = args.window_seconds
+    sess = make_session(args)
 
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = args.threads
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(args.out, so, providers=["CPUExecutionProvider"])
-    feed = {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()}
+    # Derive input shapes from the ONNX graph so we DON'T need to load the torch
+    # model (which would ~double peak RAM and OOM the 4GB Pi). Random inputs are
+    # fine for timing -- compute is data-independent.
+    feed = {}
+    for inp in sess.get_inputs():
+        shape = [d if isinstance(d, int) else 1 for d in inp.shape]
+        feed[inp.name] = np.random.randn(*shape).astype(np.float32)
 
     print(f"ORT core: threads={args.threads}  window={window_s:.3f}s")
+    print(f"  peak RSS after session load: {_fmt_mb(peak_rss_mb())}")
     sess.run(None, feed)  # warmup
     t0 = time.perf_counter()
     for _ in range(args.runs):
@@ -298,8 +364,11 @@ def cmd_bench(args):
         f"  per-forward (core only): {dt*1000:.1f} ms  |  RTF {rtf:.2f}x "
         f"({'faster' if rtf < 1 else 'SLOWER'} than real-time)"
     )
+    print(f"  peak RSS after forward: {_fmt_mb(peak_rss_mb())}")
 
     if args.torch_baseline:
+        m = get_htdemucs(args.name)
+        ctx = make_core_inputs(m)
         th.set_num_threads(args.threads)
         with th.no_grad():
             m(ctx["mix"])  # warmup
@@ -314,6 +383,51 @@ def cmd_bench(args):
         print(f"  ORT speedup vs torch: {dt_t/dt:.2f}x")
 
 
+def cmd_e2e(args):
+    """End-to-end: run demucs' real apply_model (windowing + overlap-add) on a
+    dummy track, but with the heavy core in ORT. Gives a true track-level RTF
+    directly comparable to profile_demucs.py --track-seconds. Loads the torch
+    model for the STFT/mask helpers + config, so use --lean on the Pi."""
+    import time
+
+    from demucs.apply import apply_model
+
+    m = get_htdemucs(args.name)
+    print(f"peak RSS after torch model load: {_fmt_mb(peak_rss_mb())}")
+    sess = make_session(args)
+    model = OrtCoreModel(m, sess)
+    print(f"peak RSS after ORT session: {_fmt_mb(peak_rss_mb())}")
+
+    sr = m.samplerate
+    ch = m.audio_channels
+    length = int(args.track_seconds * sr)
+    track = th.randn(1, ch, length)
+
+    print(
+        f"\n=== ORT apply_model on {args.track_seconds:.1f}s track "
+        f"(threads={args.threads}, shifts={args.shifts}, overlap={args.overlap}) ==="
+    )
+    with th.no_grad():
+        t0 = time.perf_counter()
+        apply_model(
+            model,
+            track,
+            shifts=args.shifts,
+            split=True,
+            overlap=args.overlap,
+            device="cpu",
+            progress=False,
+        )
+        dt = time.perf_counter() - t0
+
+    rtf = dt / args.track_seconds
+    print(
+        f"  wall-clock: {dt:.1f}s for {args.track_seconds:.1f}s audio -> RTF "
+        f"{rtf:.2f}x ({'faster' if rtf < 1 else 'SLOWER'} than real-time)"
+    )
+    print(f"  peak RSS during full run: {_fmt_mb(peak_rss_mb())}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--name", default="htdemucs")
@@ -322,21 +436,40 @@ def main():
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument(
+        "--window-seconds",
+        type=float,
+        default=7.8,
+        help="segment length the core was exported at (htdemucs = 39/5 = 7.8s); "
+        "only used to compute RTF in --bench",
+    )
+    ap.add_argument(
         "--torch-baseline",
         action="store_true",
         help="also time the full torch forward on this machine for comparison",
     )
+    ap.add_argument(
+        "--lean",
+        action="store_true",
+        help="low-RAM ORT session (no arena/mem-pattern, basic opt) for the 4GB Pi",
+    )
+    ap.add_argument("--track-seconds", type=float, default=60.0,
+                    help="dummy track length for --e2e")
+    ap.add_argument("--shifts", type=int, default=1, help="--e2e apply_model shifts")
+    ap.add_argument("--overlap", type=float, default=0.25, help="--e2e overlap")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--export", action="store_true")
     g.add_argument("--verify", action="store_true")
     g.add_argument("--bench", action="store_true")
+    g.add_argument("--e2e", action="store_true")
     args = ap.parse_args()
     if args.export:
         cmd_export(args)
     elif args.verify:
         cmd_verify(args)
-    else:
+    elif args.bench:
         cmd_bench(args)
+    else:
+        cmd_e2e(args)
 
 
 if __name__ == "__main__":
