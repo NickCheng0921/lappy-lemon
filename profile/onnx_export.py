@@ -268,20 +268,75 @@ def cmd_verify(args):
     print("PASS" if err < 1e-3 else "CHECK: error larger than expected")
 
 
+def cmd_bench(args):
+    """Time the ORT core forward, framed like profile_demucs.py (per-forward ms +
+    RTF on one 7.8s window). With --torch-baseline, also time the full torch
+    forward on the same box for a same-machine ORT-vs-torch comparison."""
+    import time
+
+    import onnxruntime as ort
+
+    m = get_htdemucs(args.name)
+    ctx = make_core_inputs(m)
+    sr = m.samplerate
+    window_s = float(m.segment)
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = args.threads
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess = ort.InferenceSession(args.out, so, providers=["CPUExecutionProvider"])
+    feed = {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()}
+
+    print(f"ORT core: threads={args.threads}  window={window_s:.3f}s")
+    sess.run(None, feed)  # warmup
+    t0 = time.perf_counter()
+    for _ in range(args.runs):
+        sess.run(None, feed)
+    dt = (time.perf_counter() - t0) / args.runs
+    rtf = dt / window_s
+    print(
+        f"  per-forward (core only): {dt*1000:.1f} ms  |  RTF {rtf:.2f}x "
+        f"({'faster' if rtf < 1 else 'SLOWER'} than real-time)"
+    )
+
+    if args.torch_baseline:
+        th.set_num_threads(args.threads)
+        with th.no_grad():
+            m(ctx["mix"])  # warmup
+            t0 = time.perf_counter()
+            for _ in range(args.runs):
+                m(ctx["mix"])
+            dt_t = (time.perf_counter() - t0) / args.runs
+        rtf_t = dt_t / window_s
+        print(
+            f"  torch full forward:      {dt_t*1000:.1f} ms  |  RTF {rtf_t:.2f}x"
+        )
+        print(f"  ORT speedup vs torch: {dt_t/dt:.2f}x")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--name", default="htdemucs")
     ap.add_argument("-o", "--out", default="profile/htdemucs_core.onnx")
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument(
+        "--torch-baseline",
+        action="store_true",
+        help="also time the full torch forward on this machine for comparison",
+    )
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--export", action="store_true")
     g.add_argument("--verify", action="store_true")
+    g.add_argument("--bench", action="store_true")
     args = ap.parse_args()
     if args.export:
         cmd_export(args)
-    else:
+    elif args.verify:
         cmd_verify(args)
+    else:
+        cmd_bench(args)
 
 
 if __name__ == "__main__":

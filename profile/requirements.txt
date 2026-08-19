@@ -1,0 +1,25 @@
+# Deps for profile/profile_demucs.py and profile/onnx_export.py.
+# The vendored demucs (../vendor) is used directly, so demucs itself is NOT
+# installed (avoids the sphn/Rust build that fails on the Pi). These are its
+# runtime deps plus the profiling/ONNX tooling.
+
+# --- vendored demucs runtime deps (from vendor/requirements_minimal.txt) ---
+dora-search
+einops
+julius>=0.2.3
+lameenc>=1.2
+openunmix
+pyyaml
+torch>=1.8.1
+torchaudio>=0.8,<2.1
+tqdm
+
+# numpy 2.x breaks the older torch/demucs stack -> pin below 2
+numpy<2
+
+# --- profiling ---
+thop            # profile_demucs.py --flops
+
+# --- ONNX export + benchmark (onnx_export.py) ---
+onnx
+onnxruntime
