@@ -1,0 +1,17 @@
+time OMP_NUM_THREADS=1 python profile/profile_demucs.py --device cpu --flops > profile/out.txt
+
+peak RSS at start: 221 MB
+Loading model 'htdemucs' ...
+sources=['drums', 'bass', 'other', 'vocals']  samplerate=44100  channels=2  submodels=1
+  submodel[0] params=41.98M  segment=39/5
+TOTAL params=41.98M  weight memory(fp32)=167.94MB  (int8=41.98MB)
+peak RSS after load: 472 MB
+
+Timing one submodel forward on 7.800s @ cpu (input (1, 2, 343980)) ...
+  per-forward: 27148.2 ms  |  real-time factor: 3.48x (SLOWER than real-time, one submodel)
+  full bag (~1x) est: 27148.2 ms -> RTF 3.48x
+  peak RSS after single forward: 1341 MB
+
+FLOPs (thop, one submodel, 7.800s): 260.61G  (MACs=130.30G)
+
+real    2m28.455s
