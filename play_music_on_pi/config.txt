@@ -1,0 +1,73 @@
+# ============================================================================
+# Known-good /boot/firmware/config.txt for the DA7212 Audio Board (A) on Pi 5
+#
+# Where it goes:  /boot/firmware/config.txt  (on the Pi)
+# Captured from:  nickpi — Raspberry Pi 5, Raspberry Pi OS Bookworm 64-bit
+#                 (Debian 12), kernel 6.12.96+rpt-rpi-2712, 2026-08-21
+#
+# Key points for the DA7212 HAT:
+#   - dtparam=audio=off        (onboard bcm2835 audio disabled)
+#   - dtparam=i2c_arm=on       (codec is controlled over i2c-1 @ 0x1a)
+#   - NO dtoverlay for the sound card — the HAT+ EEPROM auto-loads it at boot
+#   - The commented-out wm8960/i2s lines at the bottom are leftovers from the
+#     old WM8960 HAT; they MUST stay disabled or they steal gpio18/0x1a and
+#     playback fails with -EIO. (Also make sure seeed-voicecard.service is
+#     disabled — see SETUP_CHECKLIST.md.)
+# ============================================================================
+
+# For more options and information see
+# http://rptl.io/configtxt
+# Some settings may impact device functionality. See link above for details
+
+# Uncomment some or all of these to enable the optional hardware interfaces
+dtparam=i2c_arm=on
+#dtparam=i2s=on
+#dtparam=spi=on
+
+# Enable audio (loads snd_bcm2835)
+dtparam=audio=off
+
+# Additional overlays and parameters are documented
+# /boot/firmware/overlays/README
+
+# Automatically load overlays for detected cameras
+camera_auto_detect=1
+
+# Automatically load overlays for detected DSI displays
+display_auto_detect=1
+
+# Automatically load initramfs files, if found
+auto_initramfs=1
+
+# Enable DRM VC4 V3D driver
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Don't have the firmware create an initial video= setting in cmdline.txt.
+# Use the kernel's default instead.
+disable_fw_kms_setup=1
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable compensation for displays with overscan
+disable_overscan=1
+
+# Run as fast as firmware / board allows
+arm_boost=1
+
+[cm4]
+# Enable host mode on the 2711 built-in XHCI USB controller.
+# This line should be removed if the legacy DWC2 controller is required
+# (e.g. for USB device mode) or if USB support is not required.
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+# Old WM8960 HAT leftovers — keep disabled (conflict with DA7212 auto-detect)
+#dtoverlay=i2s-mmap
+#dtoverlay=wm8960-soundcard
+#dtoverlay=i2s-mmap
+#dtparam=i2s=on
