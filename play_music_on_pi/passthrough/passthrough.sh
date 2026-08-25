@@ -14,6 +14,12 @@
 
 set -euo pipefail
 
+# Gain stages, in dB -- keep these matched with delay.sh / chorus.sh so the
+# analog and software paths sound the same. This codec's % scale is wildly
+# non-linear (Headphone 40% = -32dB but 92% = +1dB), so always use dB.
+AUX_DB=0             # 'Aux' input PGA (max +15dB)
+OUT_DB=0             # 'Headphone'/'Lineout' output (negative = quieter)
+
 CARD=Zero            # aplay -l -> card: Zero [RPi Codec Zero] (da7213)
 STATE=$(mktemp /tmp/passthrough-state.XXXXXX)
 
@@ -40,12 +46,12 @@ if [[ "${1:-}" == "loop" ]]; then
     alsaloop -C hw:CARD=$CARD -P hw:CARD=$CARD -t 10000 --sync=none
 else
     # ---- Analog bypass: Aux -> output mixers, inside the codec. ----
-    amixer -c "$CARD" sset 'Aux' 70% on               >/dev/null
-    amixer -c "$CARD" sset 'Mixout Left Aux Left' on  >/dev/null
+    amixer -c "$CARD" sset 'Aux' "${AUX_DB}dB" on      >/dev/null
+    amixer -c "$CARD" sset 'Mixout Left Aux Left' on   >/dev/null
     amixer -c "$CARD" sset 'Mixout Right Aux Right' on >/dev/null
     # Make sure the outputs themselves are alive.
-    amixer -c "$CARD" sset 'Headphone' on             >/dev/null
-    amixer -c "$CARD" sset 'Lineout' on               >/dev/null
+    amixer -c "$CARD" sset 'Headphone' "${OUT_DB}dB" on >/dev/null
+    amixer -c "$CARD" sset 'Lineout' "${OUT_DB}dB" on   >/dev/null
     echo "Analog bypass active: AUX in -> headphone/speaker."
     echo "Volume knobs: 'Aux' (input gain), 'Headphone'/'Lineout' (output)."
     echo "Ctrl-C to stop and restore previous mixer state."
