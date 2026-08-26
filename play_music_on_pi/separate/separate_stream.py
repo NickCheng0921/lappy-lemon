@@ -169,7 +169,7 @@ class Stream:
         self.inbuf = np.zeros((sep.ch, self.win - self.stride), dtype=np.float32)
         self.next_end = self.stride
         self.incond = threading.Condition()
-        self.outq = queue.Queue(maxsize=64)
+        self.outq = queue.Queue(maxsize=8)   # blocks hold 4 stems each
         self.done = threading.Event()
 
         self.held = None                      # xfade tail from the last block
@@ -186,6 +186,11 @@ class Stream:
         self.gains = np.array(
             [self.gain_map[s] for s in SOURCES], dtype=np.float32
         )[:, None, None]
+
+    def mixdown(self, stems_block):
+        """[4, ch, n] -> [ch, n] using the CURRENT gains. Called per output
+        chunk by the writer, which is what makes the keys feel instant."""
+        return (stems_block * self.gains).sum(0)
 
     def bump(self, source, delta):
         g = min(GAIN_MAX, max(GAIN_MIN, self.gain_map[source] + delta))
@@ -228,26 +233,27 @@ class Stream:
 
             t0 = time.perf_counter()
             stems = self.sep.separate(window)          # [4, ch, win]
-            mixed = (stems * self.gains).sum(0)        # [ch, win]
             self.t_proc += time.perf_counter() - t0
             self.processed += 1
 
             # Tail slice, stopping `look` short of the raw edge. Length is
             # stride+xfade so the extra tail can be blended into the next block.
+            # Queue the STEMS, not a mix. Gains are applied by the writer at
+            # playback time, so a keypress changes what you hear on the next
+            # output chunk (~50ms) instead of waiting a full pipeline delay
+            # for freshly-separated audio to arrive.
             end = self.win - self.look
-            seg = mixed[:, end - self.stride - self.xfade : end].copy()
+            seg = stems[:, :, end - self.stride - self.xfade : end].copy()
 
             if self.held is not None and self.xfade:
-                # same absolute time range as the previous block's held tail
-                seg[:, : self.xfade] = (
-                    seg[:, : self.xfade] * self.fade_in
+                # same absolute time range as the previous block's held tail.
+                # Crossfading per-stem then summing == crossfading the sum.
+                seg[:, :, : self.xfade] = (
+                    seg[:, :, : self.xfade] * self.fade_in
                     + self.held * self.fade_out
                 )
-            out = seg[:, : self.stride] if self.held is not None else seg[
-                :, : self.stride
-            ]
-            self.held = seg[:, self.stride :].copy() if self.xfade else None
-            self.outq.put(out.copy())
+            self.held = seg[:, :, self.stride :].copy() if self.xfade else None
+            self.outq.put(seg[:, :, : self.stride].copy())
 
             if self.processed % 5 == 0:
                 rtf = self.t_proc / (self.processed * self.stride / self.sep.sr)
@@ -257,21 +263,16 @@ class Stream:
 
 
 def startup_bar(stream, sep, started, initial_rtf=0.5):
-    """Progress bar for the dead time before the first audio comes out.
+    """Plain-text progress line for the wait before the first audio.
 
-    With tail emission the 7.8s window costs nothing -- it is all lookback --
-    so the wait is only: collect one stride, run the model once, then hold
-    `preroll` seconds of jitter margin. proc is unknown until a window has
-    actually run, so start from an assumed RTF and correct the total as soon
-    as the first real measurement lands.
+    Hand-rolled rather than tqdm: the Pi ships tqdm 4.70, which raises
+    TypeError formatting a custom bar_format when set_postfix_str triggers a
+    refresh. A cosmetic progress bar is not worth a dependency that can kill a
+    thread, so this writes the line itself.
+
+    With tail emission the 7.8s window costs nothing (all lookback), so the
+    wait is: collect one stride, run the model once, hold `preroll` of jitter.
     """
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        log("(install tqdm for a progress bar)")
-        started.wait()
-        return
-
     win_s = stream.win / sep.sr
     stride_s = stream.stride / sep.sr
     look_s = stream.look / sep.sr
@@ -279,25 +280,22 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
     def estimate(proc):
         return stride_s + stream.preroll_s + proc
 
-    total = estimate(initial_rtf * win_s)
-    bar = tqdm(
-        total=round(total, 1), unit="s", dynamic_ncols=True,
-        bar_format="{desc} {bar} {n:.1f}/{total:.1f}s {postfix}",
-        desc="waiting for first block",
-    )
+    total = estimate(initial_rtf * win_s)     # refined once proc is known
+    width = 34
     t0 = time.time()
-    refined = False
     while not started.wait(0.25):
-        if not refined and stream.processed >= 1:
-            proc = stream.t_proc / stream.processed
-            total = estimate(proc)
-            bar.total = round(total, 1)
-            bar.set_postfix_str(f"proc {proc:.1f}s/window")
-            refined = True
-        bar.n = min(round(time.time() - t0, 1), bar.total)
-        bar.refresh()
-    bar.n = bar.total
-    bar.close()
+        if stream.processed >= 1:
+            total = estimate(stream.t_proc / stream.processed)
+        el = time.time() - t0
+        frac = min(1.0, el / max(total, 1e-6))
+        fill = int(width * frac)
+        sys.stderr.write(
+            f"\r  waiting for first block [{'#'*fill}{'.'*(width-fill)}] "
+            f"{el:4.1f}/{total:4.1f}s"
+        )
+        sys.stderr.flush()
+    sys.stderr.write("\r" + " " * (width + 44) + "\r")
+    sys.stderr.flush()
 
     proc = stream.t_proc / max(stream.processed, 1)
     offset = stride_s + look_s + stream.preroll_s + proc
@@ -407,21 +405,27 @@ def run_offline(stream, in_file, out_file, sep):
     t.join()
     d.join()
 
+    # queue carries stems; apply the (static, CLI-set) gains here
+    out = [stream.mixdown(b) for b in out]
     y = np.concatenate(out, axis=1) if out else np.zeros((sep.ch, 0))
     sf.write(out_file, y.T, sep.sr, subtype="PCM_16")
     log(f"wrote {out_file}  ({y.shape[1]/sep.sr:.1f}s)")
 
 
-def run_live(stream, sep, device, block):
+def run_live(stream, sep, device, block, chunk):
     started = threading.Event()   # set by the writer when playback begins
     rec = subprocess.Popen(
         ["arecord", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
          "-c", str(sep.ch), "-t", "raw", "--period-size", str(block)],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+    # --buffer-time caps ALSA's own queue. Without it aplay can sit on a
+    # second of audio, which would delay gain changes no matter how finely
+    # we mix them.
     play = subprocess.Popen(
         ["aplay", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
-         "-c", str(sep.ch), "-t", "raw"],
+         "-c", str(sep.ch), "-t", "raw",
+         "--buffer-time", "200000", "--period-time", "50000"],
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
 
@@ -448,16 +452,25 @@ def run_live(stream, sep, device, block):
         time.sleep(stream.preroll_s)
         started.set()
         buf = [first]
-        for blk in buf:
-            play.stdin.write(to_int16(blk.T.ravel()).tobytes())
-        while True:
-            blk = stream.outq.get()
-            if blk is None:
-                break
-            try:
-                play.stdin.write(to_int16(blk.T.ravel()).tobytes())
-            except BrokenPipeError:
-                break
+        def emit(blk):
+            # Slice into small pieces and re-read the gains for each one.
+            # Writing a whole 4s block at once would quantise gain changes to
+            # the block boundary; at `chunk` samples the response is ~50ms.
+            n = blk.shape[2]
+            for i in range(0, n, chunk):
+                mixed = stream.mixdown(blk[:, :, i : i + chunk])
+                play.stdin.write(to_int16(mixed.T.ravel()).tobytes())
+
+        try:
+            for blk in buf:
+                emit(blk)
+            while True:
+                blk = stream.outq.get()
+                if blk is None:
+                    break
+                emit(blk)
+        except BrokenPipeError:
+            pass
 
     stop = threading.Event()
     threads = [
@@ -468,19 +481,35 @@ def run_live(stream, sep, device, block):
     ]
     for t in threads:
         t.start()
-    log("running -- Ctrl-C to stop")
+    log("running -- Ctrl-C or q to stop")
     try:
-        while threads[2].is_alive():
+        while threads[2].is_alive() and not stop.is_set():
             threads[2].join(0.5)
     except KeyboardInterrupt:
-        log("\nstopping ...")
+        log("stopping ...")
     finally:
-        rec.terminate()
+        # Ordered shutdown. Killing the worker while ORT is mid-Run aborts
+        # in C++ ("terminate called without an active exception", preceded
+        # by a bogus Softmax/GetElementType error). So: stop capture, let
+        # the worker finish the window it is on, then tear down playback.
+        stop.set()
+        stream.finish_input()
+        try:
+            rec.terminate()
+        except Exception:
+            pass
+        worker_t = threads[1]
+        worker_t.join(timeout=(stream.win / sep.sr) + 3.0)
+        if worker_t.is_alive():
+            log("worker still busy at exit -- ORT may warn on teardown")
         try:
             play.stdin.close()
         except Exception:
             pass
-        play.terminate()
+        try:
+            play.wait(timeout=3)
+        except Exception:
+            play.terminate()
 
 
 def main():
@@ -508,7 +537,12 @@ def main():
                          "Jitter margin -- costs exactly its own value in "
                          "latency, unlike buffering a whole block")
     ap.add_argument("--device", default="plughw:CARD=Zero,DEV=0")
-    ap.add_argument("--block", type=int, default=4096)
+    ap.add_argument("--block", type=int, default=4096,
+                    help="capture read size (samples)")
+    ap.add_argument("--out-chunk", type=int, default=2048,
+                    help="playback mix granularity (samples). Gains are "
+                         "re-read per chunk, so this sets how fast the keys "
+                         "respond: 2048 @ 44.1kHz = 46ms")
     ap.add_argument("--in-file", default="")
     ap.add_argument("--out-file", default="")
     for s in SOURCES:
@@ -536,7 +570,7 @@ def main():
             sys.exit("--in-file needs --out-file")
         run_offline(stream, args.in_file, args.out_file, sep)
     else:
-        run_live(stream, sep, args.device, args.block)
+        run_live(stream, sep, args.device, args.block, args.out_chunk)
 
 
 if __name__ == "__main__":
