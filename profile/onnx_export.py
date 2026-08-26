@@ -270,12 +270,33 @@ def cmd_export(args):
     print("input shapes:", tuple(ctx["x"].shape), tuple(ctx["xt"].shape))
 
 
+def _real_audio_mix(m, path):
+    """One training-length window from a real mp3 -> [1, C, seg]. int8 models are
+    calibrated on real-audio activation ranges, so verify on real audio, NOT the
+    random noise that make_core_inputs uses (noise blows past calibrated ranges
+    and makes a good int8 model look broken)."""
+    from demucs.audio import AudioFile
+
+    sr = m.samplerate
+    seg = int(m.segment * sr)
+    wav = AudioFile(path).read(streams=0, samplerate=sr, channels=m.audio_channels)
+    start = min(seg, max(0, wav.shape[-1] - seg))  # skip the silent intro if we can
+    return wav[:, start:start + seg][None]
+
+
 def cmd_verify(args):
     import numpy as np
     import onnxruntime as ort
 
     m = get_htdemucs(args.name)
-    ctx = make_core_inputs(m)
+    if args.audio:
+        mix = _real_audio_mix(m, args.audio)
+        ctx = front(m, mix)
+        print(f"verify input: real audio {args.audio}")
+    else:
+        ctx = make_core_inputs(m)
+        print("verify input: random noise (use --audio <mp3> for a real-audio "
+              "check; int8 models NEED this)")
 
     # torch reference: full forward on the same mix.
     with th.no_grad():
@@ -296,8 +317,14 @@ def cmd_verify(args):
 
     err = (got - ref).abs().max().item()
     rel = err / (ref.abs().max().item() + 1e-9)
+    # RMS-relative error tracks perceived quality far better than a single max
+    # outlier -- this is the number to watch for int8.
+    rms_rel = (((got - ref) ** 2).mean().sqrt()
+               / ((ref ** 2).mean().sqrt() + 1e-9)).item()
     print(f"max abs err vs torch: {err:.3e}  (rel {rel:.3e})")
-    print("PASS" if err < 1e-3 else "CHECK: error larger than expected")
+    print(f"RMS-relative err:     {rms_rel:.3e}")
+    print("PASS" if err < 1e-3 else "CHECK: error larger than expected "
+          "(expected for int8 -- judge by RMS-rel + a listen, not this)")
 
 
 def peak_rss_mb():
@@ -315,21 +342,211 @@ def _fmt_mb(mb):
     return "n/a (Windows)" if mb is None else f"{mb:.0f} MB"
 
 
+def _keep_op_types(exclude):
+    """Dynamic-quantizable op types minus the excluded ones (e.g. exclude
+    'MatMul' to keep the attention/transformer in fp32 and quantize only Conv)."""
+    all_types = ["Conv", "MatMul", "Gemm"]
+    ex = {s.strip() for s in exclude.split(",") if s.strip()}
+    return [t for t in all_types if t not in ex]
+
+
+def _preprocess(src, dst):
+    """Shape inference + graph opt before quantizing. We exported with fully
+    static shapes, so skip *symbolic* shape inference (it chokes on the
+    ConvTranspose/Pad size relations and buys us nothing). Falls back to the raw
+    model if pre-processing fails -- it's optional. Returns the path to quantize."""
+    from onnxruntime.quantization.shape_inference import quant_pre_process
+
+    try:
+        print(f"pre-processing {src} ...")
+        quant_pre_process(src, dst, skip_symbolic_shape=True)
+        return dst
+    except Exception as e:
+        print(f"  pre-process skipped ({type(e).__name__}: {e}); using raw model")
+        return src
+
+
+def _iter_core_feeds(m, mp3_dir, max_windows):
+    """Yield {'mag', 'mix_t'} numpy feeds from real audio: load every mp3 under
+    mp3_dir, chop into non-overlapping training-length windows, run the torch
+    front end. These are the actual activation distributions ORT calibrates on."""
+    from demucs.audio import AudioFile
+    from tqdm import tqdm
+
+    sr = m.samplerate
+    ch = m.audio_channels
+    seg = int(m.segment * sr)
+    mp3s = sorted(Path(mp3_dir).glob("*.mp3"))
+    if not mp3s:
+        raise FileNotFoundError(f"no .mp3 files in {mp3_dir}")
+    print(f"calibration: {len(mp3s)} file(s) in {mp3_dir}")
+    n = 0
+    bar = tqdm(total=max_windows, desc="calibration windows", unit="win")
+    for path in mp3s:
+        # streams=0 -> [C, T]; the default slice(None) returns [S, C, T].
+        wav = AudioFile(path).read(streams=0, samplerate=sr, channels=ch)  # [C, T]
+        for start in range(0, wav.shape[-1] - seg + 1, seg):
+            if n >= max_windows:
+                bar.close()
+                return
+            window = wav[:, start:start + seg][None]  # [1, C, seg]
+            ctx = front(m, window)
+            yield {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()}
+            n += 1
+            bar.update(1)
+    bar.close()
+
+
+def _staged_static(model_in, model_out, reader, method, args):
+    """Run the static-PTQ stages manually with peak-RSS prints between each, to
+    find which stage OOMs: graph augmentation, the calibration forward, range
+    compute, or the final quantize/save."""
+    from onnxruntime.quantization import QuantType
+    from onnxruntime.quantization.calibrate import create_calibrator
+    from onnxruntime.quantization.qdq_quantizer import QDQQuantizer
+    import onnx
+
+    op_types = _keep_op_types(args.exclude_ops) if args.exclude_ops else None
+    aug = args.quant_out + ".augmented.onnx"
+
+    print(f"  [stage] start: peak RSS {_fmt_mb(peak_rss_mb())}")
+    calibrator = create_calibrator(
+        Path(model_in), op_types, augmented_model_path=aug,
+        calibrate_method=method,
+    )
+    print(f"  [stage] after create_calibrator (augment): peak RSS "
+          f"{_fmt_mb(peak_rss_mb())}")
+
+    calibrator.collect_data(reader)
+    print(f"  [stage] after collect_data (calib forward): peak RSS "
+          f"{_fmt_mb(peak_rss_mb())}")
+
+    tensors_range = calibrator.compute_data()
+    print(f"  [stage] after compute_data (ranges): peak RSS "
+          f"{_fmt_mb(peak_rss_mb())}")
+    del calibrator
+
+    model = onnx.load(model_in)
+    quantizer = QDQQuantizer(
+        model, args.per_channel, False, QuantType.QInt8, QuantType.QInt8,
+        tensors_range, None, None, op_types, {},
+    )
+    quantizer.quantize_model()
+    print(f"  [stage] after quantize_model: peak RSS {_fmt_mb(peak_rss_mb())}")
+    quantizer.model.save_model_to_file(model_out, False)
+    print(f"  [stage] after save: peak RSS {_fmt_mb(peak_rss_mb())}")
+    Path(aug).unlink(missing_ok=True)
+
+
+def cmd_quantize(args):
+    """int8 quantization of the fp32 core. --static (default here) does PTQ with
+    calibration over real audio in profile/calibration_mp3 -- the right tool for
+    this conv-heavy model. --no-static falls back to dynamic quant (weights only,
+    no calibration), which we found destroys quality on this CNN. Reads args.out
+    and writes args.quant_out; then verify/bench/e2e with -o <quant_out>."""
+    from onnxruntime.quantization import QuantType
+
+    def _mb(p):
+        return Path(p).stat().st_size / (1024 * 1024)
+
+    src = args.out
+    pre = args.quant_out + ".pre.onnx"
+    to_quantize = _preprocess(src, pre)
+    op_types = _keep_op_types(args.exclude_ops) if args.exclude_ops else None
+
+    if args.static:
+        from onnxruntime.quantization import (
+            CalibrationDataReader,
+            CalibrationMethod,
+            QuantFormat,
+            quantize_static,
+        )
+
+        m = get_htdemucs(args.name)
+        feeds = list(_iter_core_feeds(m, args.calib_dir, args.calib_windows))
+        print(f"  collected {len(feeds)} calibration window(s)")
+
+        class Reader(CalibrationDataReader):
+            """Supports CalibStridedMinMax streaming: ORT calls set_range() to
+            walk the data in chunks of `stride`, running collect_data (which
+            merges ranges + frees activations) per chunk. Keeps peak memory to
+            `stride` windows instead of all of them."""
+
+            def __init__(self, feeds):
+                self.feeds = feeds
+                self.start = 0
+                self.end = len(feeds)
+                self.i = 0
+
+            def set_range(self, start_index, end_index):
+                self.start = start_index
+                self.end = end_index
+                self.i = start_index
+
+            def get_next(self):
+                if self.i >= self.end:
+                    return None
+                f = self.feeds[self.i]
+                self.i += 1
+                return f
+
+            def __len__(self):
+                return len(self.feeds)
+
+        method = {
+            "minmax": CalibrationMethod.MinMax,
+            "entropy": CalibrationMethod.Entropy,
+            "percentile": CalibrationMethod.Percentile,
+        }[args.calib_method]
+        print(
+            f"quantizing (STATIC PTQ, QDQ, per_channel={args.per_channel}, "
+            f"method={args.calib_method}) ..."
+        )
+        if op_types:
+            print(f"  quantizing only op types: {op_types}")
+        else:
+            print("  quantizing all supported ops (Conv + MatMul + Gemm)")
+        # Always use the manual staged path: ORT's quantize_static wrapper OOMs
+        # on this model (its CalibStridedMinMax/deepcopy handling), while the
+        # staged augment->forward->compute->quantize peaks at a safe ~4GB.
+        _staged_static(to_quantize, args.quant_out, Reader(feeds), method, args)
+    else:
+        from onnxruntime.quantization import quantize_dynamic
+
+        print(f"quantizing (dynamic, per_channel={args.per_channel}) ...")
+        kwargs = dict(weight_type=QuantType.QInt8, per_channel=args.per_channel)
+        if op_types:
+            kwargs["op_types_to_quantize"] = op_types
+            print(f"  quantizing only op types: {op_types}")
+        quantize_dynamic(to_quantize, args.quant_out, **kwargs)
+
+    print(f"wrote {args.quant_out}")
+    print(f"  fp32 {src}: {_mb(src):.0f} MB  ->  int8 {args.quant_out}: "
+          f"{_mb(args.quant_out):.0f} MB")
+    Path(pre).unlink(missing_ok=True)
+
+
 def make_session(args):
     import onnxruntime as ort
 
     so = ort.SessionOptions()
     so.intra_op_num_threads = args.threads
+    # Graph optimization and the memory-arena/mem-pattern planner are INDEPENDENT
+    # knobs. --lean turns off the arena + mem-pattern (the real RAM savers on the
+    # 4GB Pi) but must NOT drop the optimization level: int8 (QDQ) models need
+    # full optimization to fuse Quantize/Dequantize into QLinearConv/QLinearMatMul,
+    # or you pay Q/DQ overhead with no int8 speedup. So keep opt at the chosen
+    # level regardless of --lean.
+    levels = {
+        "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+        "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+        "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+    }
+    so.graph_optimization_level = levels[args.opt_level]
     if args.lean:
-        # Low-RAM path for the 4GB Pi. The arena + mem-pattern planner and
-        # ORT_ENABLE_ALL weight pre-packing can spike peak RSS well past the
-        # model size (we saw ~3.7GB -> OOM). These trade a little speed for a
-        # much lower memory ceiling.
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         so.enable_cpu_mem_arena = False
         so.enable_mem_pattern = False
-    else:
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(args.out, so, providers=["CPUExecutionProvider"])
 
 
@@ -435,6 +652,9 @@ def main():
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--audio", default="",
+                    help="mp3 for --verify to use a real-audio window instead of "
+                    "random noise (required for a fair int8 quality check)")
     ap.add_argument(
         "--window-seconds",
         type=float,
@@ -450,8 +670,39 @@ def main():
     ap.add_argument(
         "--lean",
         action="store_true",
-        help="low-RAM ORT session (no arena/mem-pattern, basic opt) for the 4GB Pi",
+        help="low-RAM ORT session (no arena/mem-pattern) for the 4GB Pi; keeps "
+        "full graph optimization so int8 QDQ still fuses",
     )
+    ap.add_argument(
+        "--opt-level", default="all",
+        choices=["all", "extended", "basic", "disabled"],
+        help="ORT graph optimization level; keep 'all' for int8 QDQ fusion",
+    )
+    ap.add_argument("--quant-out", default="profile/htdemucs_core_int8.onnx",
+                    help="output path for --quantize")
+    ap.add_argument("--per-channel", action="store_true",
+                    help="per-channel weight quant (much better for conv)")
+    ap.add_argument("--exclude-ops", default="",
+                    help="comma-sep op types to NOT quantize, e.g. 'MatMul' to "
+                    "keep the transformer/attention in fp32")
+    ap.add_argument("--static", action="store_true", default=True,
+                    help="static PTQ with calibration (default; right for CNNs)")
+    ap.add_argument("--no-static", dest="static", action="store_false",
+                    help="use dynamic quant instead (weights only, no calibration)")
+    ap.add_argument("--calib-dir", default="profile/calibration_mp3",
+                    help="folder of mp3s to calibrate static PTQ on")
+    ap.add_argument("--calib-windows", type=int, default=64,
+                    help="max 7.8s windows to calibrate on")
+    ap.add_argument("--calib-method", default="minmax",
+                    choices=["minmax", "entropy", "percentile"])
+    ap.add_argument("--debug-stages", action="store_true",
+                    help="run static PTQ stage-by-stage with peak-RSS prints to "
+                    "locate the OOM")
+    ap.add_argument("--calib-stride", type=int, default=1,
+                    help="stream calibration in chunks of this many windows "
+                    "(CalibStridedMinMax); keeps peak RAM to this many windows. "
+                    "0 = collect all at once. minmax only. must divide "
+                    "--calib-windows.")
     ap.add_argument("--track-seconds", type=float, default=60.0,
                     help="dummy track length for --e2e")
     ap.add_argument("--shifts", type=int, default=1, help="--e2e apply_model shifts")
@@ -461,6 +712,7 @@ def main():
     g.add_argument("--verify", action="store_true")
     g.add_argument("--bench", action="store_true")
     g.add_argument("--e2e", action="store_true")
+    g.add_argument("--quantize", action="store_true")
     args = ap.parse_args()
     if args.export:
         cmd_export(args)
@@ -468,6 +720,8 @@ def main():
         cmd_verify(args)
     elif args.bench:
         cmd_bench(args)
+    elif args.quantize:
+        cmd_quantize(args)
     else:
         cmd_e2e(args)
 

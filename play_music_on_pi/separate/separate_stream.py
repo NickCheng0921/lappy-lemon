@@ -126,34 +126,55 @@ class Separator:
         return out[0].numpy()  # [4, ch, win]
 
 
-def triangular(n):
-    """demucs-style window: peaks in the middle, where the model is most
-    accurate, so overlap-add trusts window centres over their edges."""
-    half = n // 2
-    w = np.concatenate(
-        [np.arange(1, half + 1), np.arange(n - half, 0, -1)]
-    ).astype(np.float32)
-    return w / w.max()
-
-
 class Stream:
-    def __init__(self, sep, overlap, gains, preroll):
+    """Sliding-window streaming with TAIL emission.
+
+    The window is 7.8s of context, but all of it is lookback: we keep a rolling
+    buffer of the most recent `win` samples and emit the freshly-computed TAIL
+    each cycle. Nothing waits for a window to "fill", so the window length costs
+    zero latency -- only `proc + stride + lookahead + preroll` remain.
+
+    Two details that make it work:
+      * lookahead -- the last frames of a window have no future context and
+        measure ~7dB worse than centre. We stop short of the true edge by
+        `lookahead` seconds and give up that much latency to get the quality back.
+      * crossfade -- consecutive emissions come from *different* model runs, so
+        they meet at a seam. We compute a little extra and crossfade the join.
+    """
+
+    def __init__(self, sep, gains, stride_s, lookahead_s, xfade_s, preroll_s):
         self.sep = sep
         self.win = sep.win
-        self.stride = max(1, int(self.win * (1.0 - overlap)))
+        sr = sep.sr
+        self.stride = int(stride_s * sr)
+        self.look = int(lookahead_s * sr)
+        self.xfade = int(xfade_s * sr)
+        self.preroll_s = preroll_s
+
+        if self.stride + self.look + self.xfade > self.win:
+            raise SystemExit("stride + lookahead + xfade must fit inside the "
+                             f"{self.win/sr:.2f}s window")
+
         self.gain_map = dict(gains)
         self._rebuild_gains()
-        self.wnd = triangular(self.win)[None, :]  # [1, win]
-        self.preroll = preroll
 
-        self.inbuf = np.zeros((sep.ch, 0), dtype=np.float32)
+        # Absolute-position buffer. A fixed rolling window has a FLOATING right
+        # edge: if a feed lands between two worker passes, the next window's
+        # edge advances by more than `stride` and the emitted region silently
+        # skips audio. Tracking absolute sample indices makes each window's
+        # position exact regardless of feed granularity.
+        #   buf holds absolute samples [self.base, self.base + buf.shape[1])
+        #   next_end = absolute right edge of the window to process next
+        self.base = -(self.win - self.stride)
+        self.inbuf = np.zeros((sep.ch, self.win - self.stride), dtype=np.float32)
+        self.next_end = self.stride
         self.incond = threading.Condition()
         self.outq = queue.Queue(maxsize=64)
         self.done = threading.Event()
 
-        # overlap-add accumulators
-        self.acc = np.zeros((sep.ch, self.win), dtype=np.float32)
-        self.accw = np.zeros((1, self.win), dtype=np.float32)
+        self.held = None                      # xfade tail from the last block
+        f = np.linspace(0.0, 1.0, self.xfade, dtype=np.float32)[None, :]
+        self.fade_in, self.fade_out = f, 1.0 - f
 
         self.processed = 0
         self.t_proc = 0.0
@@ -174,9 +195,11 @@ class Stream:
 
     # ---------------------------------------------------------------- input
     def feed(self, block):
+        """Append new samples. Positions are absolute, so feed granularity is
+        irrelevant -- partial chunks can no longer shift a window's edge."""
         with self.incond:
             self.inbuf = np.concatenate([self.inbuf, block], axis=1)
-            self.incond.notify()
+            self.incond.notify_all()
 
     def finish_input(self):
         self.done.set()
@@ -187,58 +210,60 @@ class Stream:
     def worker(self):
         while True:
             with self.incond:
-                while self.inbuf.shape[1] < self.win and not self.done.is_set():
+                have = lambda: self.base + self.inbuf.shape[1] >= self.next_end
+                while not have() and not self.done.is_set():
                     self.incond.wait(timeout=0.5)
-                if self.inbuf.shape[1] < self.win:
-                    if self.done.is_set():
-                        break  # not enough left for a full window
-                    continue
-                chunk = self.inbuf[:, : self.win].copy()
-                self.inbuf = self.inbuf[:, self.stride :]
+                if not have():
+                    break                        # input ended mid-window
+                end = self.next_end
+                st = end - self.win - self.base
+                window = self.inbuf[:, st : st + self.win].copy()
+                self.next_end += self.stride
+                # drop what no future window can reference
+                keep = max(0, (self.next_end - self.win) - self.base)
+                if keep:
+                    self.inbuf = self.inbuf[:, keep:]
+                    self.base += keep
+                self.incond.notify_all()
 
             t0 = time.perf_counter()
-            stems = self.sep.separate(chunk)  # [4, ch, win]
-            mixed = (stems * self.gains).sum(0)  # [ch, win]
+            stems = self.sep.separate(window)          # [4, ch, win]
+            mixed = (stems * self.gains).sum(0)        # [ch, win]
             self.t_proc += time.perf_counter() - t0
             self.processed += 1
 
-            # overlap-add with the triangular window
-            self.acc += mixed * self.wnd
-            self.accw += self.wnd
+            # Tail slice, stopping `look` short of the raw edge. Length is
+            # stride+xfade so the extra tail can be blended into the next block.
+            end = self.win - self.look
+            seg = mixed[:, end - self.stride - self.xfade : end].copy()
 
-            w = np.maximum(self.accw[:, : self.stride], 1e-6)
-            self.outq.put((self.acc[:, : self.stride] / w).copy())
-
-            # slide accumulators forward by one stride
-            pad = np.zeros((self.acc.shape[0], self.stride), dtype=np.float32)
-            self.acc = np.concatenate([self.acc[:, self.stride :], pad], axis=1)
-            self.accw = np.concatenate(
-                [
-                    self.accw[:, self.stride :],
-                    np.zeros((1, self.stride), dtype=np.float32),
-                ],
-                axis=1,
-            )
+            if self.held is not None and self.xfade:
+                # same absolute time range as the previous block's held tail
+                seg[:, : self.xfade] = (
+                    seg[:, : self.xfade] * self.fade_in
+                    + self.held * self.fade_out
+                )
+            out = seg[:, : self.stride] if self.held is not None else seg[
+                :, : self.stride
+            ]
+            self.held = seg[:, self.stride :].copy() if self.xfade else None
+            self.outq.put(out.copy())
 
             if self.processed % 5 == 0:
-                rtf = self.t_proc / (self.processed * self.win / self.sep.sr)
-                warn = "  !! SLOWER THAN REAL TIME" if rtf > 1 else ""
-                log(f"  windows={self.processed}  avg RTF={rtf:.2f}x{warn}")
+                rtf = self.t_proc / (self.processed * self.stride / self.sep.sr)
+                warn = "  !! CANNOT KEEP UP" if rtf > 1 else ""
+                log(f"  blocks={self.processed}  proc/stride={rtf:.2f}x{warn}")
         self.outq.put(None)
 
 
 def startup_bar(stream, sep, started, initial_rtf=0.5):
     """Progress bar for the dead time before the first audio comes out.
 
-    Time-to-first-sound is predictable, so show it rather than leaving the user
-    guessing. Block k can only exist once its window has been captured (capture
-    is real-time) and then processed:
-
-        t(block k) = window + k*stride + proc
-        playback starts at block (preroll-1)
-
-    proc is unknown until a window has actually run, so start from an assumed
-    RTF and correct the total as soon as the first real measurement lands.
+    With tail emission the 7.8s window costs nothing -- it is all lookback --
+    so the wait is only: collect one stride, run the model once, then hold
+    `preroll` seconds of jitter margin. proc is unknown until a window has
+    actually run, so start from an assumed RTF and correct the total as soon
+    as the first real measurement lands.
     """
     try:
         from tqdm import tqdm
@@ -249,14 +274,17 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
 
     win_s = stream.win / sep.sr
     stride_s = stream.stride / sep.sr
+    look_s = stream.look / sep.sr
 
     def estimate(proc):
-        return win_s + (stream.preroll - 1) * stride_s + proc
+        return stride_s + stream.preroll_s + proc
 
     total = estimate(initial_rtf * win_s)
-    bar = tqdm(total=round(total, 1), unit="s", dynamic_ncols=True,
-               bar_format="{desc} {bar} {n:.1f}/{total:.1f}s {postfix}",
-               desc="filling delay buffer")
+    bar = tqdm(
+        total=round(total, 1), unit="s", dynamic_ncols=True,
+        bar_format="{desc} {bar} {n:.1f}/{total:.1f}s {postfix}",
+        desc="waiting for first block",
+    )
     t0 = time.time()
     refined = False
     while not started.wait(0.25):
@@ -264,15 +292,20 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
             proc = stream.t_proc / stream.processed
             total = estimate(proc)
             bar.total = round(total, 1)
-            bar.set_postfix_str(f"proc {proc:.1f}s/window, RTF {proc/win_s:.2f}x")
+            bar.set_postfix_str(f"proc {proc:.1f}s/window")
             refined = True
         bar.n = min(round(time.time() - t0, 1), bar.total)
         bar.refresh()
     bar.n = bar.total
     bar.close()
-    log(f"output live after {time.time()-t0:.1f}s "
-        f"(audio you hear is ~{win_s + (stream.preroll-1)*stride_s:.0f}s behind "
-        f"the input, and stays that far behind)")
+
+    proc = stream.t_proc / max(stream.processed, 1)
+    offset = stride_s + look_s + stream.preroll_s + proc
+    log(f"output live after {time.time()-t0:.1f}s -- audio is "
+        f"{offset:.1f}s behind the input and stays there "
+        f"({stride_s:.1f}s block + {look_s:.1f}s lookahead + "
+        f"{stream.preroll_s:.1f}s jitter + {proc:.1f}s inference; "
+        f"the {win_s:.1f}s window itself costs nothing)")
 
 
 def keyboard(stream, stop):
@@ -348,20 +381,31 @@ def run_offline(stream, in_file, out_file, sep):
 
     t = threading.Thread(target=stream.worker, daemon=True)
     t.start()
-    # pad so the tail still forms a full final window
-    wav = np.concatenate(
-        [wav, np.zeros((sep.ch, stream.win), dtype=np.float32)], axis=1
-    )
-    stream.feed(wav)
-    stream.finish_input()
 
     out = []
-    while True:
-        blk = stream.outq.get()
-        if blk is None:
-            break
-        out.append(blk)
+
+    def drain():
+        while True:
+            blk = stream.outq.get()
+            if blk is None:
+                break
+            out.append(blk)
+
+    d = threading.Thread(target=drain, daemon=True)
+    d.start()
+
+    # Feed in stride-sized chunks, exactly as the live reader does, so offline
+    # output is bit-for-bit what the stream would produce. Trailing pad lets
+    # the last real audio reach the emitted tail region.
+    pad = stream.stride + stream.look + stream.xfade
+    wav = np.concatenate(
+        [wav, np.zeros((sep.ch, pad), dtype=np.float32)], axis=1
+    )
+    for i in range(0, wav.shape[1], stream.stride):
+        stream.feed(wav[:, i : i + stream.stride])
+    stream.finish_input()
     t.join()
+    d.join()
 
     y = np.concatenate(out, axis=1) if out else np.zeros((sep.ch, 0))
     sf.write(out_file, y.T, sep.sr, subtype="PCM_16")
@@ -394,13 +438,16 @@ def run_live(stream, sep, device, block):
     def writer():
         # Preroll: hold back `preroll` blocks so one slow window never starves
         # the DAC mid-phrase. This IS the delay buffer.
-        buf = []
-        while len(buf) < stream.preroll:
-            blk = stream.outq.get()
-            if blk is None:
-                break
-            buf.append(blk)
+        # Wait for the first block, then hold an extra `preroll_s` before
+        # starting. Delaying by a fraction of a block buys jitter margin at
+        # 1:1 in latency, instead of paying a whole stride for it.
+        first = stream.outq.get()
+        if first is None:
+            started.set()
+            return
+        time.sleep(stream.preroll_s)
         started.set()
+        buf = [first]
         for blk in buf:
             play.stdin.write(to_int16(blk.T.ravel()).tobytes())
         while True:
@@ -445,11 +492,21 @@ def main():
                     help="ORT threads. 1 was the optimisation target, but for "
                          "live playback use the cores you have -- headroom "
                          "against underruns beats a benchmark number")
-    ap.add_argument("--overlap", type=float, default=0.1,
-                    help="window overlap. 0 is fastest but seams click; 0.1 "
-                         "measured 0.88x e2e, still faster than real time")
-    ap.add_argument("--preroll", type=int, default=2,
-                    help="output blocks buffered before playback starts")
+    ap.add_argument("--stride", type=float, default=4.0,
+                    help="seconds of audio emitted per model run. MUST exceed "
+                         "the per-window inference time (~3.1s on the Pi) or "
+                         "the stream falls behind permanently")
+    ap.add_argument("--lookahead", type=float, default=1.3,
+                    help="stop this far short of the window's right edge. "
+                         "Measured: the last 0.65s is ~7dB worse than centre, "
+                         "1.3s back recovers most of it")
+    ap.add_argument("--xfade", type=float, default=0.1,
+                    help="crossfade between consecutive blocks (they come from "
+                         "different model runs, so the join needs smoothing)")
+    ap.add_argument("--preroll", type=float, default=1.0,
+                    help="SECONDS of output buffered before playback starts. "
+                         "Jitter margin -- costs exactly its own value in "
+                         "latency, unlike buffering a whole block")
     ap.add_argument("--device", default="plughw:CARD=Zero,DEV=0")
     ap.add_argument("--block", type=int, default=4096)
     ap.add_argument("--in-file", default="")
@@ -463,11 +520,16 @@ def main():
     log(f"stem gains: {gains}")
 
     sep = Separator(args.model, args.repo, threads=args.threads)
-    stream = Stream(sep, args.overlap, gains, args.preroll)
+    stream = Stream(sep, gains, args.stride, args.lookahead, args.xfade,
+                    args.preroll)
     log(
-        f"window {stream.win/sep.sr:.2f}s  stride {stream.stride/sep.sr:.2f}s "
-        f"(overlap {args.overlap})  threads {args.threads}"
+        f"window {stream.win/sep.sr:.2f}s (all lookback)  "
+        f"stride {args.stride:.2f}s  lookahead {args.lookahead:.2f}s  "
+        f"xfade {args.xfade:.2f}s  preroll {args.preroll:.2f}s  "
+        f"threads {args.threads}"
     )
+    log(f"expected latency ~= proc + {args.stride + args.lookahead + args.preroll:.1f}s"
+        f"  (proc measured after the first block)")
 
     if args.in_file:
         if not args.out_file:
