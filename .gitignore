@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------- datasets
+# MUSDB18 is licensed and request-gated (zenodo.org/record/1117372) -- it must
+# not be redistributed through this repo. Fetch it and run build_cache.py.
+pi_optimize_demucs/musdb18/
+pi_optimize_demucs/musdb18_cache/
+**/musdb18*/
+
+# Commercial music used for PTQ calibration / listening tests. Copyrighted.
+profile/calibration_mp3/
+test_demucs/
+
+# ------------------------------------------------------------------ models
+# Exported graphs and checkpoints: ~2.6 GB, and all reproducible from
+# prune_init.py -> distill.py -> export_student.py -> simplify.py.
+pi_optimize_demucs/models/
+*.onnx
+*.onnx.data
+*.pt
+*.ckpt
+
+# The two artifacts actually worth keeping are the trained student weights and
+# its exported graph. They are too big for git; back them up out of band:
+#   pi_optimize_demucs/models/student_distilled_best.pt   (35 MB, SDR 5.44 dB)
+#   pi_optimize_demucs/models/student_final_slim.onnx     (56 MB, Pi RTF 0.64x)
+
+# ------------------------------------------------------------------ outputs
+# ORT profiler dumps -- regenerate with bench_core.py --profile
+onnxruntime_profile__*.json
+profile/out.txt
+
+# separated / rendered audio
+*.wav
+*.flac
+!vendor/**/*.wav
+
+# ---------------------------------------------------------------- scratch
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.tmp.npy
+nohup.out
+
+# NOTE: pi_optimize_demucs/logs/ is deliberately NOT ignored. Those are small
+# text files and they are the record of the 18h training run (SDR curve, the
+# quantization OOM traces) that FINDINGS.md refers to.
