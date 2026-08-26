@@ -15,8 +15,15 @@ window before it can separate anything, then needs time to run it. So the output
 necessarily lags the input by about one window plus the processing time. The
 delay buffer is what makes that lag smooth instead of glitchy.
 
-The per-stem GAINS are the hook for live mixing later -- set vocals to 0 for an
-instant karaoke feed, or solo the drums, without touching anything else.
+Stem gains are adjustable live from the keyboard while it runs:
+
+    u i o p   +5%     drums  bass  other  vocals
+    j k l ;   -5%
+    r         reset every stem to 100%
+    q         quit
+
+Each keypress prints the new gain dict to stdout. --vocals 0 (etc.) still sets
+the starting value from the command line.
 
 Two modes:
   offline (no audio device, safe to test):
@@ -37,6 +44,15 @@ import numpy as np
 
 # ----------------------------------------------------------------- mix knobs
 GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
+
+# Live control. The two key banks sit directly above/below each other on a
+# QWERTY board, one column per stem, so muscle memory maps to the mixer:
+#     u i o p   -> +5%   drums bass other vocals
+#     j k l ;   -> -5%
+KEYS_UP = "uiop"
+KEYS_DOWN = "jkl;"
+STEP = 0.05
+GAIN_MIN, GAIN_MAX = 0.0, 2.0
 # ----------------------------------------------------------------------------
 
 SOURCES = ["drums", "bass", "other", "vocals"]
@@ -125,9 +141,8 @@ class Stream:
         self.sep = sep
         self.win = sep.win
         self.stride = max(1, int(self.win * (1.0 - overlap)))
-        self.gains = np.array(
-            [gains[s] for s in SOURCES], dtype=np.float32
-        )[:, None, None]
+        self.gain_map = dict(gains)
+        self._rebuild_gains()
         self.wnd = triangular(self.win)[None, :]  # [1, win]
         self.preroll = preroll
 
@@ -142,6 +157,20 @@ class Stream:
 
         self.processed = 0
         self.t_proc = 0.0
+
+    # ----------------------------------------------------------------- mix
+    def _rebuild_gains(self):
+        # Replacing the whole array is an atomic rebind, so the worker either
+        # sees the old gains or the new ones -- never a half-updated mix.
+        self.gains = np.array(
+            [self.gain_map[s] for s in SOURCES], dtype=np.float32
+        )[:, None, None]
+
+    def bump(self, source, delta):
+        g = min(GAIN_MAX, max(GAIN_MIN, self.gain_map[source] + delta))
+        self.gain_map[source] = round(g, 4)
+        self._rebuild_gains()
+        return self.gain_map
 
     # ---------------------------------------------------------------- input
     def feed(self, block):
@@ -246,6 +275,53 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
         f"the input, and stays that far behind)")
 
 
+def keyboard(stream, stop):
+    """Read single keypresses and nudge stem gains live.
+
+    cbreak (not raw) so keys arrive unbuffered without swallowing Ctrl-C, and
+    the old termios state is always restored -- otherwise a crash leaves the
+    user's shell with no echo.
+    """
+    import select
+    import termios
+    import tty
+
+    if not sys.stdin.isatty():
+        log("stdin is not a tty -- live gain keys disabled")
+        return
+
+    def show(g):
+        body = ", ".join(f"'{k}': {v:.2f}" for k, v in g.items())
+        print("{" + body + "}", flush=True)
+
+    log(f"keys: {'/'.join(KEYS_UP)} = +{STEP:.0%}   "
+        f"{'/'.join(KEYS_DOWN)} = -{STEP:.0%}   "
+        f"(drums bass other vocals)   r = reset   q = quit")
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not stop.is_set():
+            if not select.select([sys.stdin], [], [], 0.2)[0]:
+                continue
+            c = sys.stdin.read(1)
+            if c in ("q", ""):
+                stop.set()
+                break
+            if c == "r":
+                for k in SOURCES:
+                    stream.gain_map[k] = 1.0
+                stream._rebuild_gains()
+                show(stream.gain_map)
+            elif c in KEYS_UP:
+                show(stream.bump(SOURCES[KEYS_UP.index(c)], STEP))
+            elif c in KEYS_DOWN:
+                show(stream.bump(SOURCES[KEYS_DOWN.index(c)], -STEP))
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def to_int16(x):
     return (np.clip(x, -1.0, 1.0) * 32767.0).astype("<i2")
 
@@ -336,10 +412,12 @@ def run_live(stream, sep, device, block):
             except BrokenPipeError:
                 break
 
+    stop = threading.Event()
     threads = [
         threading.Thread(target=f, daemon=True)
         for f in (reader, stream.worker, writer,
-                  lambda: startup_bar(stream, sep, started))
+                  lambda: startup_bar(stream, sep, started),
+                  lambda: keyboard(stream, stop))
     ]
     for t in threads:
         t.start()
