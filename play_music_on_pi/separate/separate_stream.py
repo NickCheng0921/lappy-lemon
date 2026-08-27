@@ -17,8 +17,8 @@ delay buffer is what makes that lag smooth instead of glitchy.
 
 Stem gains are adjustable live from the keyboard while it runs:
 
-    u i o p   +5%     drums  bass  other  vocals
-    j k l ;   -5%
+    u i o p   +10%    drums  bass  other  vocals
+    j k l ;   -10%
     r         reset every stem to 100%
     q         quit
 
@@ -47,11 +47,11 @@ GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
 
 # Live control. The two key banks sit directly above/below each other on a
 # QWERTY board, one column per stem, so muscle memory maps to the mixer:
-#     u i o p   -> +5%   drums bass other vocals
-#     j k l ;   -> -5%
+#     u i o p   -> +10%  drums bass other vocals
+#     j k l ;   -> -10%
 KEYS_UP = "uiop"
 KEYS_DOWN = "jkl;"
-STEP = 0.05
+STEP = 0.1
 GAIN_MIN, GAIN_MAX = 0.0, 2.0
 # ----------------------------------------------------------------------------
 
