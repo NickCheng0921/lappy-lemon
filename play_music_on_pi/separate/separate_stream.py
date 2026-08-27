@@ -480,7 +480,33 @@ def run_offline(stream, in_file, out_file, sep):
     log(f"wrote {out_file}  ({y.shape[1]/sep.sr:.1f}s)")
 
 
-def run_live(stream, sep, device, block, chunk):
+def _cap_pipe(fobj, nbytes, sep):
+    """Shrink the pipe feeding aplay. Returns its size in ms of audio.
+
+    Best-effort: a kernel without F_SETPIPE_SZ, or one that refuses the size,
+    costs latency but nothing else, so warn and carry on rather than refusing
+    to play. The kernel rounds to a page and reports what it actually did.
+    """
+    import fcntl
+
+    def as_ms(n):
+        return n / (sep.sr * sep.ch * 2) * 1000.0
+
+    fd = fobj.fileno()
+    try:
+        before = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, nbytes)
+        after = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+    except (AttributeError, OSError) as e:
+        log(f"warning: could not resize the aplay pipe ({e}); "
+            "key response will lag by however much it holds")
+        return None
+    log(f"aplay pipe {before} -> {after} bytes ({as_ms(before):.0f}ms -> "
+        f"{as_ms(after):.0f}ms of audio held at the old gain)")
+    return as_ms(after)
+
+
+def run_live(stream, sep, device, block, chunk, pipe_bytes):
     started = threading.Event()   # set by the writer when playback begins
     rec = subprocess.Popen(
         ["arecord", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
@@ -496,6 +522,21 @@ def run_live(stream, sep, device, block, chunk):
          "--buffer-time", "200000", "--period-time", "50000"],
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+    # ...and the pipe INTO aplay needs the same treatment, for the same
+    # reason. Everything past mixdown() is committed at the old gain, and
+    # Raspberry Pi OS gives a new pipe 256 KiB = 1.49s of stereo S16 -- more
+    # than the whole preroll cushion, so without this the cushion drains out
+    # of outq (where it is still 4 separate stems a keypress can reach) and
+    # sits here as finished PCM instead. Capping the pipe keeps the cushion
+    # upstream; ALSA's 200ms buffer is what guards against underruns.
+    # Must happen before the writer starts -- shrinking a pipe with data
+    # already queued is not reliably allowed.
+    pipe_ms = _cap_pipe(play.stdin, pipe_bytes, sep)
+    if pipe_ms is not None:
+        chunk_ms = chunk / sep.sr * 1000.0
+        log(f"key response ~= {chunk_ms + pipe_ms + 200:.0f}ms "
+            f"({chunk_ms:.0f} mix chunk + {pipe_ms:.0f} pipe + 200 ALSA); "
+            "this is separate from the ~9.5s pipeline latency")
 
     def reader():
         nbytes = block * sep.ch * 2
@@ -611,6 +652,10 @@ def main():
                     help="playback mix granularity (samples). Gains are "
                          "re-read per chunk, so this sets how fast the keys "
                          "respond: 2048 @ 44.1kHz = 46ms")
+    ap.add_argument("--pipe-bytes", type=int, default=16384,
+                    help="cap on the pipe into aplay. This is finished PCM, "
+                         "so it delays key response 1:1: 16384 @ 44.1kHz "
+                         "stereo = 93ms. Raise it if you get underruns")
     ap.add_argument("--in-file", default="")
     ap.add_argument("--out-file", default="")
     for s in SOURCES:
@@ -638,7 +683,8 @@ def main():
             sys.exit("--in-file needs --out-file")
         run_offline(stream, args.in_file, args.out_file, sep)
     else:
-        run_live(stream, sep, args.device, args.block, args.out_chunk)
+        run_live(stream, sep, args.device, args.block, args.out_chunk,
+                 args.pipe_bytes)
 
 
 if __name__ == "__main__":
