@@ -15,15 +15,18 @@ window before it can separate anything, then needs time to run it. So the output
 necessarily lags the input by about one window plus the processing time. The
 delay buffer is what makes that lag smooth instead of glitchy.
 
-Stem gains are adjustable live from the keyboard while it runs:
+Stem gains are adjustable live from the keyboard while it runs. Steps are in
+decibels, so one press sounds like the same size move wherever the fader sits:
 
-    u i o p   +10%    drums  bass  other  vocals
-    j k l ;   -10%
-    r         reset every stem to 100%
+    7 8 9 0   mute toggle    drums  bass  other  vocals
+    u i o p   +1.5 dB
+    j k l ;   -1.5 dB
+    r         reset every stem to unity
     q         quit
 
-Each keypress prints the new gain dict to stdout. --vocals 0 (etc.) still sets
-the starting value from the command line.
+Each keypress prints the new gains to stdout as both a linear multiplier and
+dB. --vocals 0 (etc.) still sets the starting value from the command line, and
+stays a linear multiplier there: 1.0 = unity, 0 = silence.
 
 Two modes:
   offline (no audio device, safe to test):
@@ -33,6 +36,7 @@ Two modes:
 """
 
 import argparse
+import math
 import queue
 import subprocess
 import sys
@@ -45,14 +49,33 @@ import numpy as np
 # ----------------------------------------------------------------- mix knobs
 GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
 
-# Live control. The two key banks sit directly above/below each other on a
-# QWERTY board, one column per stem, so muscle memory maps to the mixer:
-#     u i o p   -> +10%  drums bass other vocals
-#     j k l ;   -> -10%
+# Live control. The key banks sit directly above/below each other on a QWERTY
+# board, one column per stem, so muscle memory maps to the mixer:
+#     7 8 9 0   -> mute toggle   drums bass other vocals
+#     u i o p   -> louder
+#     j k l ;   -> quieter
+KEYS_MUTE = "7890"
 KEYS_UP = "uiop"
 KEYS_DOWN = "jkl;"
-STEP = 0.1
-GAIN_MIN, GAIN_MAX = 0.0, 2.0
+
+# Steps are multiplicative (in dB), not additive. Loudness tracks dB, so a
+# fixed *amplitude* step is wildly uneven: +0.1 is 6 dB near silence but only
+# 0.4 dB near the top of the range, i.e. one press did 14x more at one end of
+# the fader than the other. 1.5 dB is a bit above the just-noticeable
+# difference for a complex signal, so every press is audible and none is a
+# jump.
+STEP_DB = 1.5
+GAIN_MAX_DB = 12.0     # boost ceiling; the 4 stems are summed and hard-clipped
+                       # at +/-1.0 in to_int16(), so more than this is mush
+
+# A dB fader never reaches zero on its own, so silence has to be a decision
+# rather than a limit. Hold the press count instead of the depth: ten presses
+# down from unity kills a stem, the ninth is the quietest audible setting, and
+# a press back up from silence returns there. Deriving the floor from the step
+# keeps that count fixed if STEP_DB ever changes.
+PRESSES_TO_MUTE = 10
+MUTE_FLOOR_DB = -STEP_DB * (PRESSES_TO_MUTE - 1)
+GAIN_MIN, GAIN_MAX = 0.0, 10.0 ** (GAIN_MAX_DB / 20.0)
 # ----------------------------------------------------------------------------
 
 SOURCES = ["drums", "bass", "other", "vocals"]
@@ -156,6 +179,7 @@ class Stream:
                              f"{self.win/sr:.2f}s window")
 
         self.gain_map = dict(gains)
+        self.premute = {}                     # gain to restore on un-mute
         self._rebuild_gains()
 
         # Absolute-position buffer. A fixed rolling window has a FLOATING right
@@ -192,9 +216,43 @@ class Stream:
         chunk by the writer, which is what makes the keys feel instant."""
         return (stems_block * self.gains).sum(0)
 
-    def bump(self, source, delta):
-        g = min(GAIN_MAX, max(GAIN_MIN, self.gain_map[source] + delta))
-        self.gain_map[source] = round(g, 4)
+    def bump(self, source, steps):
+        """Move a stem by `steps` * STEP_DB decibels.
+
+        Multiplicative, so the move is the same perceived size at any fader
+        position. Silence is a special case at both ends: log10(0) has no
+        answer, so a stem stepped below MUTE_FLOOR_DB snaps to zero instead of
+        decaying forever, and a stem at zero re-enters the scale at that same
+        floor -- see PRESSES_TO_MUTE.
+        """
+        g = self.gain_map[source]
+        # Silence sits one step *below* the floor, so a down-press and the
+        # up-press undoing it are exact inverses: -13.5 dB -> mute -> -13.5 dB.
+        # Parking it at the floor instead would skip the quietest setting on
+        # the way back up.
+        db = (MUTE_FLOOR_DB - STEP_DB) if g <= 0.0 else 20.0 * math.log10(g)
+        # Quantise in dB, the unit the limits are written in. The fader's
+        # position lives in gain_map as a multiplier, so every press round
+        # trips through log10/10**; rounding the *gain* instead let that error
+        # land a press a hair below MUTE_FLOOR_DB and mute a step early, now
+        # that the floor sits exactly on a step boundary.
+        db = round(db + steps * STEP_DB, 3)
+        g = GAIN_MIN if db < MUTE_FLOOR_DB else min(GAIN_MAX, 10.0 ** (db / 20.0))
+        self.gain_map[source] = g
+        self._rebuild_gains()
+        return self.gain_map
+
+    def toggle_mute(self, source):
+        """Silence a stem, or restore whatever it was before the mute.
+
+        Stepping down still takes PRESSES_TO_MUTE presses, which is too slow
+        to kill a stem mid-song, and it forgets where the fader was.
+        """
+        if self.gain_map[source] > 0.0:
+            self.premute[source] = self.gain_map[source]
+            self.gain_map[source] = GAIN_MIN
+        else:
+            self.gain_map[source] = self.premute.get(source, 1.0)
         self._rebuild_gains()
         return self.gain_map
 
@@ -322,11 +380,18 @@ def keyboard(stream, stop):
         return
 
     def show(g):
-        body = ", ".join(f"'{k}': {v:.2f}" for k, v in g.items())
-        print("{" + body + "}", flush=True)
+        # Both units: dB is what the ear reads, the multiplier is what the
+        # mixdown actually does and what --vocals etc. take.
+        body = "  ".join(
+            f"{k} {'mute' if v <= 0.0 else f'{20 * math.log10(v):+5.1f}dB'}"
+            f" ({v:.2f})"
+            for k, v in g.items()
+        )
+        print(body, flush=True)
 
-    log(f"keys: {'/'.join(KEYS_UP)} = +{STEP:.0%}   "
-        f"{'/'.join(KEYS_DOWN)} = -{STEP:.0%}   "
+    log(f"keys: {'/'.join(KEYS_UP)} = +{STEP_DB}dB   "
+        f"{'/'.join(KEYS_DOWN)} = -{STEP_DB}dB   "
+        f"{'/'.join(KEYS_MUTE)} = mute   "
         f"(drums bass other vocals)   r = reset   q = quit")
 
     fd = sys.stdin.fileno()
@@ -343,12 +408,15 @@ def keyboard(stream, stop):
             if c == "r":
                 for k in SOURCES:
                     stream.gain_map[k] = 1.0
+                stream.premute.clear()
                 stream._rebuild_gains()
                 show(stream.gain_map)
             elif c in KEYS_UP:
-                show(stream.bump(SOURCES[KEYS_UP.index(c)], STEP))
+                show(stream.bump(SOURCES[KEYS_UP.index(c)], +1))
             elif c in KEYS_DOWN:
-                show(stream.bump(SOURCES[KEYS_DOWN.index(c)], -STEP))
+                show(stream.bump(SOURCES[KEYS_DOWN.index(c)], -1))
+            elif c in KEYS_MUTE:
+                show(stream.toggle_mute(SOURCES[KEYS_MUTE.index(c)]))
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
