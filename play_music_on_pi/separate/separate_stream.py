@@ -57,6 +57,11 @@ GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
 KEYS_MUTE = "7890"
 KEYS_UP = "uiop"
 KEYS_DOWN = "jkl;"
+# Master volume. Put level control HERE, after the model, not on the source:
+# source-side volume is baked into the waveform and inherits the full pipeline
+# delay, whereas this is applied at playback and responds in ~300ms.
+KEY_MASTER_UP = "="
+KEY_MASTER_DOWN = "-"
 
 # Steps are multiplicative (in dB), not additive. Loudness tracks dB, so a
 # fixed *amplitude* step is wildly uneven: +0.1 is 6 dB near silence but only
@@ -180,6 +185,7 @@ class Stream:
 
         self.gain_map = dict(gains)
         self.premute = {}                     # gain to restore on un-mute
+        self.master = 1.0                     # post-model level control
         self._rebuild_gains()
 
         # Absolute-position buffer. A fixed rolling window has a FLOATING right
@@ -207,8 +213,9 @@ class Stream:
     def _rebuild_gains(self):
         # Replacing the whole array is an atomic rebind, so the worker either
         # sees the old gains or the new ones -- never a half-updated mix.
-        self.gains = np.array(
-            [self.gain_map[s] for s in SOURCES], dtype=np.float32
+        self.gains = (
+            np.array([self.gain_map[s] for s in SOURCES], dtype=np.float32)
+            * self.master
         )[:, None, None]
 
     def mixdown(self, stems_block):
@@ -239,6 +246,26 @@ class Stream:
         db = round(db + steps * STEP_DB, 3)
         g = GAIN_MIN if db < MUTE_FLOOR_DB else min(GAIN_MAX, 10.0 ** (db / 20.0))
         self.gain_map[source] = g
+        self._rebuild_gains()
+        return self.gain_map
+
+    def bump_master(self, steps):
+        """Move the master by `steps` * STEP_DB dB.
+
+        This is the level control that responds fast. Turning the volume up at
+        the SOURCE changes the waveform itself, so it is captured, separated and
+        only heard a full pipeline delay later. Master is applied at mixdown,
+        after the model, so it lands in ~300ms.
+        """
+        db = (
+            (MUTE_FLOOR_DB - STEP_DB)
+            if self.master <= 0.0
+            else 20.0 * math.log10(self.master)
+        )
+        db = round(db + steps * STEP_DB, 3)
+        self.master = (
+            GAIN_MIN if db < MUTE_FLOOR_DB else min(GAIN_MAX, 10.0 ** (db / 20.0))
+        )
         self._rebuild_gains()
         return self.gain_map
 
@@ -387,7 +414,9 @@ def keyboard(stream, stop):
             f" ({v:.2f})"
             for k, v in g.items()
         )
-        print(body, flush=True)
+        m = stream.master
+        mstr = "mute" if m <= 0.0 else f"{20 * math.log10(m):+5.1f}dB"
+        print(f"{body}   |  master {mstr} ({m:.2f})", flush=True)
 
     log(f"keys: {'/'.join(KEYS_UP)} = +{STEP_DB}dB   "
         f"{'/'.join(KEYS_DOWN)} = -{STEP_DB}dB   "
@@ -409,8 +438,13 @@ def keyboard(stream, stop):
                 for k in SOURCES:
                     stream.gain_map[k] = 1.0
                 stream.premute.clear()
+                stream.master = 1.0
                 stream._rebuild_gains()
                 show(stream.gain_map)
+            elif c == KEY_MASTER_UP:
+                show(stream.bump_master(+1))
+            elif c == KEY_MASTER_DOWN:
+                show(stream.bump_master(-1))
             elif c in KEYS_UP:
                 show(stream.bump(SOURCES[KEYS_UP.index(c)], +1))
             elif c in KEYS_DOWN:
@@ -522,6 +556,21 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes):
          "--buffer-time", "200000", "--period-time", "50000"],
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+
+    # Shrink the OS pipe to aplay. The default on this Pi is 262144 bytes =
+    # 1486ms of stereo s16 -- audio already mixed and committed downstream,
+    # which is what a gain change has to wait behind. 16KB leaves ~93ms.
+    # Combined with the 200ms ALSA ring that puts key response near 300ms
+    # instead of ~1.7s.
+    try:
+        import fcntl
+        F_SETPIPE_SZ, F_GETPIPE_SZ = 1031, 1032
+        fcntl.fcntl(play.stdin.fileno(), F_SETPIPE_SZ, 16384)
+        got = fcntl.fcntl(play.stdin.fileno(), F_GETPIPE_SZ)
+        log(f"output pipe {got} bytes "
+            f"({1000*got/(sep.sr*sep.ch*2):.0f}ms committed)")
+    except Exception as e:
+        log(f"could not shrink output pipe ({e}); key response will lag")
     # ...and the pipe INTO aplay needs the same treatment, for the same
     # reason. Everything past mixdown() is committed at the old gain, and
     # Raspberry Pi OS gives a new pipe 256 KiB = 1.49s of stereo S16 -- more
