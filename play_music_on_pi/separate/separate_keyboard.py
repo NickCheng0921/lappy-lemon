@@ -15,24 +15,18 @@ window before it can separate anything, then needs time to run it. So the output
 necessarily lags the input by about one window plus the processing time. The
 delay buffer is what makes that lag smooth instead of glitchy.
 
-Stem gains come from five slide pots on two ADS1115 ADCs, read over i2c-1
-(pi_hw_test/five_pot_test.py has the wiring and a bench test):
+Stem gains are adjustable live from the keyboard while it runs. Steps are in
+decibels, so one press sounds like the same size move wherever the fader sits:
 
-    fader 0..3   drums  bass  other  vocals
-    fader 4      master
+    7 8 9 0   mute toggle    drums  bass  other  vocals
+    u i o p   +1.5 dB
+    j k l ;   -1.5 dB
+    r         reset every stem to unity
+    q         quit
 
-A fader is ABSOLUTE where the keys were relative: its position IS the gain, so
-there is no mute toggle and no un-mute memory. The travel is mapped in decibels,
-the unit the ear reads, over the same range the keys covered:
-
-    top 20%      unity .. +12 dB    boost
-    at 80%       unity
-    bottom 80%   -13.5 dB .. unity  cut
-    bottom 2%    silent
-
---vocals 0 (etc.) still sets a starting value from the command line, but the
-first fader poll overwrites it -- that is what absolute means. The
-keyboard-controlled version of this app is separate_keyboard.py.
+Each keypress prints the new gains to stdout as both a linear multiplier and
+dB. --vocals 0 (etc.) still sets the starting value from the command line, and
+stays a linear multiplier there: 1.0 = unity, 0 = silence.
 
 Two modes:
   offline (no audio device, safe to test):
@@ -43,7 +37,6 @@ Two modes:
 
 import argparse
 import math
-import os
 import queue
 import subprocess
 import sys
@@ -53,51 +46,44 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    from fader_viz import FaderViz
-except ImportError:                       # display is cosmetic; app is not
-    FaderViz = None
-
 # ----------------------------------------------------------------- mix knobs
 GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
 
-# The travel is mapped in dB, not in amplitude. Loudness tracks dB, so a fader
-# that is linear in amplitude is wildly uneven: the same physical distance is
-# 6 dB near silence and 0.4 dB near the ceiling, i.e. 14x more effect at one
-# end of the slider than the other. STEP_DB survives the move from keys to
-# pots because MUTE_FLOOR_DB is still derived from it.
+# Live control. The key banks sit directly above/below each other on a QWERTY
+# board, one column per stem, so muscle memory maps to the mixer:
+#     7 8 9 0   -> mute toggle   drums bass other vocals
+#     u i o p   -> louder
+#     j k l ;   -> quieter
+KEYS_MUTE = "7890"
+KEYS_UP = "uiop"
+KEYS_DOWN = "jkl;"
+# Master volume. Put level control HERE, after the model, not on the source:
+# source-side volume is baked into the waveform and inherits the full pipeline
+# delay, whereas this is applied at playback and responds in ~300ms.
+KEY_MASTER_UP = "="
+KEY_MASTER_DOWN = "-"
+
+# Steps are multiplicative (in dB), not additive. Loudness tracks dB, so a
+# fixed *amplitude* step is wildly uneven: +0.1 is 6 dB near silence but only
+# 0.4 dB near the top of the range, i.e. one press did 14x more at one end of
+# the fader than the other. 1.5 dB is a bit above the just-noticeable
+# difference for a complex signal, so every press is audible and none is a
+# jump.
 STEP_DB = 1.5
 GAIN_MAX_DB = 12.0     # boost ceiling; the 4 stems are summed and hard-clipped
                        # at +/-1.0 in to_int16(), so more than this is mush
 
 # A dB fader never reaches zero on its own, so silence has to be a decision
-# rather than a limit. The keyboard build counted presses (ten down from unity
-# kills a stem, the ninth is the quietest audible setting); a pot has no press
-# count, so POT_MUTE_POS declares the bottom of the travel off and the usable
-# scale ends one notch above it, here, at MUTE_FLOOR_DB.
+# rather than a limit. Hold the press count instead of the depth: ten presses
+# down from unity kills a stem, the ninth is the quietest audible setting, and
+# a press back up from silence returns there. Deriving the floor from the step
+# keeps that count fixed if STEP_DB ever changes.
 PRESSES_TO_MUTE = 10
 MUTE_FLOOR_DB = -STEP_DB * (PRESSES_TO_MUTE - 1)
 GAIN_MIN, GAIN_MAX = 0.0, 10.0 ** (GAIN_MAX_DB / 20.0)
 # ----------------------------------------------------------------------------
 
 SOURCES = ["drums", "bass", "other", "vocals"]
-
-# ------------------------------------------------------------------- faders
-# Five slide pots on two ADS1115s (4 channels each, addresses set by the ADDR
-# pin: GND=0x48, VDD=0x49). Unused ADC channels must be tied to GND -- a
-# floating input reads as a convincing mid-scale position, not as zero.
-POT_MAP_DEFAULT = "0x48:0,1,2,3 0x49:0"
-POT_UNITY_POS = 0.80     # travel fraction that means unity gain
-POT_MUTE_POS = 0.02      # below this a fader is off, not merely quiet
-POT_DEADBAND = 0.002     # ignore jitter smaller than this (ADC noise is ~2 LSB)
-POT_SMOOTH = 0.5         # one-pole EMA on position; 1.0 disables smoothing
-
-I2C_SLAVE = 0x0703
-ADS_REG_CONV, ADS_REG_CONFIG = 0x00, 0x01
-ADS_MUX_SINGLE = {0: 0x4, 1: 0x5, 2: 0x6, 3: 0x7}
-ADS_PGA = 0x1            # +/-4.096V full scale, clears a 3.3V rail with room
-ADS_FSR_VOLTS = 4.096
-ADS_DR_CODE, ADS_DR_SPS = 4, 128
 
 
 def log(*a):
@@ -198,6 +184,7 @@ class Stream:
                              f"{self.win/sr:.2f}s window")
 
         self.gain_map = dict(gains)
+        self.premute = {}                     # gain to restore on un-mute
         self.master = 1.0                     # post-model level control
         self._rebuild_gains()
 
@@ -236,16 +223,63 @@ class Stream:
         chunk by the writer, which is what makes the keys feel instant."""
         return (stems_block * self.gains).sum(0)
 
-    def set_positions(self, positions):
-        """Absolute fader positions (0..1, the stems then master) -> gains.
+    def bump(self, source, steps):
+        """Move a stem by `steps` * STEP_DB decibels.
 
-        One _rebuild_gains() for the whole set, not one per fader: the rebuild
-        is an atomic rebind, so the worker sees either the old mix or the new
-        one and never new vocals against an old master.
+        Multiplicative, so the move is the same perceived size at any fader
+        position. Silence is a special case at both ends: log10(0) has no
+        answer, so a stem stepped below MUTE_FLOOR_DB snaps to zero instead of
+        decaying forever, and a stem at zero re-enters the scale at that same
+        floor -- see PRESSES_TO_MUTE.
         """
-        for name, pos in zip(SOURCES, positions):
-            self.gain_map[name] = pot_gain(pos)
-        self.master = pot_gain(positions[len(SOURCES)])
+        g = self.gain_map[source]
+        # Silence sits one step *below* the floor, so a down-press and the
+        # up-press undoing it are exact inverses: -13.5 dB -> mute -> -13.5 dB.
+        # Parking it at the floor instead would skip the quietest setting on
+        # the way back up.
+        db = (MUTE_FLOOR_DB - STEP_DB) if g <= 0.0 else 20.0 * math.log10(g)
+        # Quantise in dB, the unit the limits are written in. The fader's
+        # position lives in gain_map as a multiplier, so every press round
+        # trips through log10/10**; rounding the *gain* instead let that error
+        # land a press a hair below MUTE_FLOOR_DB and mute a step early, now
+        # that the floor sits exactly on a step boundary.
+        db = round(db + steps * STEP_DB, 3)
+        g = GAIN_MIN if db < MUTE_FLOOR_DB else min(GAIN_MAX, 10.0 ** (db / 20.0))
+        self.gain_map[source] = g
+        self._rebuild_gains()
+        return self.gain_map
+
+    def bump_master(self, steps):
+        """Move the master by `steps` * STEP_DB dB.
+
+        This is the level control that responds fast. Turning the volume up at
+        the SOURCE changes the waveform itself, so it is captured, separated and
+        only heard a full pipeline delay later. Master is applied at mixdown,
+        after the model, so it lands in ~300ms.
+        """
+        db = (
+            (MUTE_FLOOR_DB - STEP_DB)
+            if self.master <= 0.0
+            else 20.0 * math.log10(self.master)
+        )
+        db = round(db + steps * STEP_DB, 3)
+        self.master = (
+            GAIN_MIN if db < MUTE_FLOOR_DB else min(GAIN_MAX, 10.0 ** (db / 20.0))
+        )
+        self._rebuild_gains()
+        return self.gain_map
+
+    def toggle_mute(self, source):
+        """Silence a stem, or restore whatever it was before the mute.
+
+        Stepping down still takes PRESSES_TO_MUTE presses, which is too slow
+        to kill a stem mid-song, and it forgets where the fader was.
+        """
+        if self.gain_map[source] > 0.0:
+            self.premute[source] = self.gain_map[source]
+            self.gain_map[source] = GAIN_MIN
+        else:
+            self.gain_map[source] = self.premute.get(source, 1.0)
         self._rebuild_gains()
         return self.gain_map
 
@@ -357,181 +391,68 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
         f"the {win_s:.1f}s window itself costs nothing)")
 
 
-def pot_gain(pos):
-    """Fader position (0..1) -> linear gain, on the range the keys used.
+def keyboard(stream, stop):
+    """Read single keypresses and nudge stem gains live.
 
-    The top of the travel above POT_UNITY_POS is boost (0 .. GAIN_MAX_DB) and
-    everything below it is cut (MUTE_FLOOR_DB .. 0). Both halves are linear in
-    dB rather than in amplitude, for the reason STEP_DB exists: a fixed
-    amplitude move is 6 dB near silence and 0.4 dB near the ceiling, so a
-    linear-in-amplitude fader would do 14x more at one end than the other.
-
-    Silence stays a decision rather than a limit, as it was for the keys.
-    A dB fader never reaches zero, so the bottom POT_MUTE_POS of the travel is
-    declared off; the usable scale ends one notch above it at MUTE_FLOOR_DB.
+    cbreak (not raw) so keys arrive unbuffered without swallowing Ctrl-C, and
+    the old termios state is always restored -- otherwise a crash leaves the
+    user's shell with no echo.
     """
-    if pos <= POT_MUTE_POS:
-        return GAIN_MIN
-    if pos >= POT_UNITY_POS:
-        frac = (pos - POT_UNITY_POS) / max(1.0 - POT_UNITY_POS, 1e-9)
-        db = min(1.0, frac) * GAIN_MAX_DB
-    else:
-        frac = (pos - POT_MUTE_POS) / (POT_UNITY_POS - POT_MUTE_POS)
-        db = MUTE_FLOOR_DB * (1.0 - frac)
-    return min(GAIN_MAX, 10.0 ** (db / 20.0))
+    import select
+    import termios
+    import tty
 
-
-class Ads1115:
-    """Minimal single-shot ADS1115 reader over raw /dev/i2c-N.
-
-    No smbus2 on the Pi venv and no reason to add one: this is three registers.
-    Single-shot rather than continuous because one ADC sits behind a 4-way mux,
-    so continuous mode only ever tracks the latched channel.
-    """
-
-    def __init__(self, bus, addr):
-        import fcntl
-        self.addr = addr
-        self.fd = os.open("/dev/i2c-" + str(bus), os.O_RDWR)
-        # I2C_SLAVE only latches the target address -- it never touches the
-        # bus, so an absent board opens fine and fails later with EREMOTEIO.
-        # Probe here, where the error can still say something useful.
-        fcntl.ioctl(self.fd, I2C_SLAVE, addr)
-        try:
-            os.write(self.fd, bytes([ADS_REG_CONFIG]))
-            os.read(self.fd, 2)
-        except OSError:
-            os.close(self.fd)
-            raise OSError("no ADS1115 answering at 0x%02x on i2c-%d"
-                          % (addr, bus))
-
-    def close(self):
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
-
-    def read_channel(self, channel):
-        msb = 0x80 | (ADS_MUX_SINGLE[channel] << 4) | (ADS_PGA << 1) | 0x01
-        lsb = (ADS_DR_CODE << 5) | 0x03
-        os.write(self.fd, bytes([ADS_REG_CONFIG, msb, lsb]))
-        time.sleep(1.0 / ADS_DR_SPS)
-        deadline = time.time() + 0.25
-        while True:
-            os.write(self.fd, bytes([ADS_REG_CONFIG]))
-            if os.read(self.fd, 2)[0] & 0x80:      # OS bit set = conversion done
-                break
-            if time.time() > deadline:
-                raise TimeoutError("0x%02x ch%d never finished"
-                                   % (self.addr, channel))
-            time.sleep(0.0005)
-        os.write(self.fd, bytes([ADS_REG_CONV]))
-        hi, lo = os.read(self.fd, 2)
-        val = (hi << 8) | lo
-        if val & 0x8000:                           # 16-bit two's complement
-            val -= 0x10000
-        return val
-
-
-def parse_pot_map(spec):
-    """'0x48:0,1,2,3 0x49:0' -> [(addr, channel), ...] in fader order."""
-    out = []
-    for group in spec.split():
-        addr_s, _, chans = group.partition(":")
-        for c in chans.split(","):
-            out.append((int(addr_s, 0), int(c)))
-    return out
-
-
-def pots(stream, stop, cfg, started=None):
-    """Poll the five faders and drive the mix. Runs in its own thread.
-
-    A wiring fault must not take the audio down with it: a board that will not
-    answer, or a read that fails mid-song, logs and leaves the gains where they
-    are instead of raising. Losing fader control is an annoyance; losing the
-    stream mid-song is the thing this app exists to avoid.
-    """
-    if cfg is None:
+    if not sys.stdin.isatty():
+        log("stdin is not a tty -- live gain keys disabled")
         return
+
+    def show(g):
+        # Both units: dB is what the ear reads, the multiplier is what the
+        # mixdown actually does and what --vocals etc. take.
+        body = "  ".join(
+            f"{k} {'mute' if v <= 0.0 else f'{20 * math.log10(v):+5.1f}dB'}"
+            f" ({v:.2f})"
+            for k, v in g.items()
+        )
+        m = stream.master
+        mstr = "mute" if m <= 0.0 else f"{20 * math.log10(m):+5.1f}dB"
+        print(f"{body}   |  master {mstr} ({m:.2f})", flush=True)
+
+    log(f"keys: {'/'.join(KEYS_UP)} = +{STEP_DB}dB   "
+        f"{'/'.join(KEYS_DOWN)} = -{STEP_DB}dB   "
+        f"{'/'.join(KEYS_MUTE)} = mute   "
+        f"(drums bass other vocals)   r = reset   q = quit")
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
     try:
-        chans = parse_pot_map(cfg["map"])
-    except ValueError as e:
-        log("bad --pot-map %r (%s) -- faders disabled" % (cfg["map"], e))
-        return
-    want = len(SOURCES) + 1
-    if len(chans) != want:
-        log("--pot-map lists %d faders, need %d (%s + master) -- faders off"
-            % (len(chans), want, " ".join(SOURCES)))
-        return
-
-    boards = {}
-    try:
-        for addr, _ in chans:
-            if addr not in boards:
-                boards[addr] = Ads1115(cfg["bus"], addr)
-    except OSError as e:
-        for b in boards.values():
-            b.close()
-        log("%s -- faders disabled, keeping the command-line gains" % e)
-        log("check ADDR (GND=0x48, VDD=0x49) and `sudo i2cdetect -y 1`")
-        return
-
-    names = SOURCES + ["master"]
-    log("faders: " + "  ".join("%s=0x%02x:A%d" % (n, a, c)
-                               for n, (a, c) in zip(names, chans)))
-    log("unity at %.0f%% travel, %+.0fdB at the top, %.1fdB just above %.0f%%, "
-        "silent below that"
-        % (100 * POT_UNITY_POS, GAIN_MAX_DB, MUTE_FLOOR_DB,
-           100 * POT_MUTE_POS))
-
-    viz = None
-    if FaderViz is not None and cfg.get("viz", "auto") != "off":
-        try:
-            viz = FaderViz(names, mode=cfg.get("viz", "auto"),
-                           unity_pos=POT_UNITY_POS)
-        except Exception as e:                    # never fatal
-            log("fader display off (%s)" % e)
-
-    smooth = [None] * len(chans)
-    shown = False
-    sent = [None] * len(chans)
-    period = 1.0 / max(cfg["hz"], 1e-3)
-    try:
+        tty.setcbreak(fd)
         while not stop.is_set():
-            t0 = time.time()
-            try:
-                for i, (addr, chan) in enumerate(chans):
-                    raw = boards[addr].read_channel(chan)
-                    volts = raw * ADS_FSR_VOLTS / 32768.0
-                    pos = min(max(volts / cfg["vref"], 0.0), 1.0)
-                    smooth[i] = pos if smooth[i] is None else (
-                        smooth[i] + POT_SMOOTH * (pos - smooth[i]))
-            except (OSError, TimeoutError) as e:
-                log("fader read failed (%s) -- holding the last gains" % e)
-                if viz is not None:
-                    viz.invalidate()
-                time.sleep(0.5)
+            if not select.select([sys.stdin], [], [], 0.2)[0]:
                 continue
-            # Only rebuild when something actually moved. The ADC jitters a
-            # couple of LSB even at rest, and rebuilding on that would churn
-            # the gain array under the writer for no audible reason.
-            moved = any(sent[i] is None
-                        or abs(smooth[i] - sent[i]) > POT_DEADBAND
-                        for i in range(len(chans)))
-            if moved:
-                sent = list(smooth)
-                stream.set_positions(sent)
-            # The display waits for playback to start: until then startup_bar()
-            # owns the console, and two threads redrawing it just fight.
-            if viz is not None and (started is None or started.is_set()):
-                if moved or not shown:
-                    viz.draw(sent, [stream.gain_map[s] for s in SOURCES]
-                                   + [stream.master])
-                    shown = True
-            time.sleep(max(0.0, period - (time.time() - t0)))
+            c = sys.stdin.read(1)
+            if c in ("q", ""):
+                stop.set()
+                break
+            if c == "r":
+                for k in SOURCES:
+                    stream.gain_map[k] = 1.0
+                stream.premute.clear()
+                stream.master = 1.0
+                stream._rebuild_gains()
+                show(stream.gain_map)
+            elif c == KEY_MASTER_UP:
+                show(stream.bump_master(+1))
+            elif c == KEY_MASTER_DOWN:
+                show(stream.bump_master(-1))
+            elif c in KEYS_UP:
+                show(stream.bump(SOURCES[KEYS_UP.index(c)], +1))
+            elif c in KEYS_DOWN:
+                show(stream.bump(SOURCES[KEYS_DOWN.index(c)], -1))
+            elif c in KEYS_MUTE:
+                show(stream.toggle_mute(SOURCES[KEYS_MUTE.index(c)]))
     finally:
-        for b in boards.values():
-            b.close()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def to_int16(x):
@@ -619,7 +540,7 @@ def _cap_pipe(fobj, nbytes, sep):
     return as_ms(after)
 
 
-def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
+def run_live(stream, sep, device, block, chunk, pipe_bytes):
     started = threading.Event()   # set by the writer when playback begins
     rec = subprocess.Popen(
         ["arecord", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
@@ -662,7 +583,7 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
     pipe_ms = _cap_pipe(play.stdin, pipe_bytes, sep)
     if pipe_ms is not None:
         chunk_ms = chunk / sep.sr * 1000.0
-        log(f"fader response ~= {chunk_ms + pipe_ms + 200:.0f}ms "
+        log(f"key response ~= {chunk_ms + pipe_ms + 200:.0f}ms "
             f"({chunk_ms:.0f} mix chunk + {pipe_ms:.0f} pipe + 200 ALSA); "
             "this is separate from the ~9.5s pipeline latency")
 
@@ -714,11 +635,11 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
         threading.Thread(target=f, daemon=True)
         for f in (reader, stream.worker, writer,
                   lambda: startup_bar(stream, sep, started),
-                  lambda: pots(stream, stop, pot_cfg, started))
+                  lambda: keyboard(stream, stop))
     ]
     for t in threads:
         t.start()
-    log("running -- Ctrl-C to stop")
+    log("running -- Ctrl-C or q to stop")
     try:
         while threads[2].is_alive() and not stop.is_set():
             threads[2].join(0.5)
@@ -784,27 +705,6 @@ def main():
                     help="cap on the pipe into aplay. This is finished PCM, "
                          "so it delays key response 1:1: 16384 @ 44.1kHz "
                          "stereo = 93ms. Raise it if you get underruns")
-    ap.add_argument("--pot-map", default=POT_MAP_DEFAULT,
-                    help="fader -> ADC channel map, in the order "
-                         + " ".join(SOURCES) + " master. Addresses come from "
-                         "the ADS1115 ADDR pin: GND=0x48, VDD=0x49")
-    ap.add_argument("--pot-bus", type=int, default=1,
-                    help="i2c bus. The DA7212 codec shares it at 0x1a, which "
-                         "is fine -- i2c is a bus and 0x48/0x49 do not collide")
-    ap.add_argument("--pot-vref", type=float, default=3.295,
-                    help="volts at the top of fader travel, i.e. what counts "
-                         "as unity*max. Measured 3.295 on this rig, not 3.300; "
-                         "read it off five_pot_test.py and set it here")
-    ap.add_argument("--pot-hz", type=float, default=20.0,
-                    help="fader poll rate. A 5-fader scan takes ~40ms at "
-                         "128 SPS, so much above 20 just spins")
-    ap.add_argument("--fader-viz", default="auto",
-                    choices=("auto", "ansi", "plain", "off"),
-                    help="live fader bars. auto picks ansi only on a tty, and "
-                         "`ssh host cmd` is not one -- pass ansi explicitly if "
-                         "a real terminal is reading the other end of the pipe")
-    ap.add_argument("--no-pots", action="store_true",
-                    help="ignore the faders and keep the command-line gains")
     ap.add_argument("--in-file", default="")
     ap.add_argument("--out-file", default="")
     for s in SOURCES:
@@ -832,13 +732,8 @@ def main():
             sys.exit("--in-file needs --out-file")
         run_offline(stream, args.in_file, args.out_file, sep)
     else:
-        pot_cfg = None if args.no_pots else {
-            "map": args.pot_map, "bus": args.pot_bus,
-            "vref": args.pot_vref, "hz": args.pot_hz,
-            "viz": args.fader_viz,
-        }
         run_live(stream, sep, args.device, args.block, args.out_chunk,
-                 args.pipe_bytes, pot_cfg)
+                 args.pipe_bytes)
 
 
 if __name__ == "__main__":
