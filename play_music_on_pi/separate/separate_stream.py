@@ -55,7 +55,7 @@ import numpy as np
 
 try:
     from fader_viz import FaderViz
-except ImportError:                       # display is cosmetic; app is not
+except ImportError:  # display is cosmetic; app is not
     FaderViz = None
 
 # ----------------------------------------------------------------- mix knobs
@@ -67,8 +67,8 @@ GAINS = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
 # end of the slider than the other. STEP_DB survives the move from keys to
 # pots because MUTE_FLOOR_DB is still derived from it.
 STEP_DB = 1.5
-GAIN_MAX_DB = 12.0     # boost ceiling; the 4 stems are summed and hard-clipped
-                       # at +/-1.0 in to_int16(), so more than this is mush
+GAIN_MAX_DB = 12.0  # boost ceiling; the 4 stems are summed and hard-clipped
+# at +/-1.0 in to_int16(), so more than this is mush
 
 # A dB fader never reaches zero on its own, so silence has to be a decision
 # rather than a limit. The keyboard build counted presses (ten down from unity
@@ -87,15 +87,20 @@ SOURCES = ["drums", "bass", "other", "vocals"]
 # pin: GND=0x48, VDD=0x49). Unused ADC channels must be tied to GND -- a
 # floating input reads as a convincing mid-scale position, not as zero.
 POT_MAP_DEFAULT = "0x48:0,1,2,3 0x49:0"
-POT_UNITY_POS = 0.80     # travel fraction that means unity gain
-POT_MUTE_POS = 0.02      # below this a fader is off, not merely quiet
-POT_DEADBAND = 0.002     # ignore jitter smaller than this (ADC noise is ~2 LSB)
-POT_SMOOTH = 0.5         # one-pole EMA on position; 1.0 disables smoothing
+POT_UNITY_POS = 0.80  # travel fraction that means unity gain
+POT_MUTE_POS = 0.02  # below this a fader is off, not merely quiet
+POT_SMOOTH = 0.5  # one-pole EMA on position; 1.0 disables smoothing
+
+# Travel is quantised into detents, so ADC noise cannot move the gain at all.
+# Hysteresis is what makes that work -- without it a fader parked on a boundary
+# flips between two detents, which is worse than the jitter it replaces.
+POT_STEPS = 20  # 5% of travel each
+POT_HYST = 0.25  # must overshoot the midpoint by this much to move
 
 I2C_SLAVE = 0x0703
 ADS_REG_CONV, ADS_REG_CONFIG = 0x00, 0x01
 ADS_MUX_SINGLE = {0: 0x4, 1: 0x5, 2: 0x6, 3: 0x7}
-ADS_PGA = 0x1            # +/-4.096V full scale, clears a 3.3V rail with room
+ADS_PGA = 0x1  # +/-4.096V full scale, clears a 3.3V rail with room
 ADS_FSR_VOLTS = 4.096
 ADS_DR_CODE, ADS_DR_SPS = 4, 128
 
@@ -162,9 +167,7 @@ class Separator:
             x, xt = self.sess.run(
                 None, {"mag": ctx["x"].numpy(), "mix_t": ctx["xt"].numpy()}
             )
-            out = self.reconstruct(
-                self.m, th.from_numpy(x), th.from_numpy(xt), ctx
-            )
+            out = self.reconstruct(self.m, th.from_numpy(x), th.from_numpy(xt), ctx)
         return out[0].numpy()  # [4, ch, win]
 
 
@@ -194,11 +197,13 @@ class Stream:
         self.preroll_s = preroll_s
 
         if self.stride + self.look + self.xfade > self.win:
-            raise SystemExit("stride + lookahead + xfade must fit inside the "
-                             f"{self.win/sr:.2f}s window")
+            raise SystemExit(
+                "stride + lookahead + xfade must fit inside the "
+                f"{self.win/sr:.2f}s window"
+            )
 
         self.gain_map = dict(gains)
-        self.master = 1.0                     # post-model level control
+        self.master = 1.0  # post-model level control
         self._rebuild_gains()
 
         # Absolute-position buffer. A fixed rolling window has a FLOATING right
@@ -212,10 +217,10 @@ class Stream:
         self.inbuf = np.zeros((sep.ch, self.win - self.stride), dtype=np.float32)
         self.next_end = self.stride
         self.incond = threading.Condition()
-        self.outq = queue.Queue(maxsize=8)   # blocks hold 4 stems each
+        self.outq = queue.Queue(maxsize=8)  # blocks hold 4 stems each
         self.done = threading.Event()
 
-        self.held = None                      # xfade tail from the last block
+        self.held = None  # xfade tail from the last block
         f = np.linspace(0.0, 1.0, self.xfade, dtype=np.float32)[None, :]
         self.fade_in, self.fade_out = f, 1.0 - f
 
@@ -270,7 +275,7 @@ class Stream:
                 while not have() and not self.done.is_set():
                     self.incond.wait(timeout=0.5)
                 if not have():
-                    break                        # input ended mid-window
+                    break  # input ended mid-window
                 end = self.next_end
                 st = end - self.win - self.base
                 window = self.inbuf[:, st : st + self.win].copy()
@@ -283,7 +288,7 @@ class Stream:
                 self.incond.notify_all()
 
             t0 = time.perf_counter()
-            stems = self.sep.separate(window)          # [4, ch, win]
+            stems = self.sep.separate(window)  # [4, ch, win]
             self.t_proc += time.perf_counter() - t0
             self.processed += 1
 
@@ -300,8 +305,7 @@ class Stream:
                 # same absolute time range as the previous block's held tail.
                 # Crossfading per-stem then summing == crossfading the sum.
                 seg[:, :, : self.xfade] = (
-                    seg[:, :, : self.xfade] * self.fade_in
-                    + self.held * self.fade_out
+                    seg[:, :, : self.xfade] * self.fade_in + self.held * self.fade_out
                 )
             self.held = seg[:, :, self.stride :].copy() if self.xfade else None
             self.outq.put(seg[:, :, : self.stride].copy())
@@ -331,7 +335,7 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
     def estimate(proc):
         return stride_s + stream.preroll_s + proc
 
-    total = estimate(initial_rtf * win_s)     # refined once proc is known
+    total = estimate(initial_rtf * win_s)  # refined once proc is known
     width = 34
     t0 = time.time()
     while not started.wait(0.25):
@@ -350,11 +354,24 @@ def startup_bar(stream, sep, started, initial_rtf=0.5):
 
     proc = stream.t_proc / max(stream.processed, 1)
     offset = stride_s + look_s + stream.preroll_s + proc
-    log(f"output live after {time.time()-t0:.1f}s -- audio is "
+    log(
+        f"output live after {time.time()-t0:.1f}s -- audio is "
         f"{offset:.1f}s behind the input and stays there "
         f"({stride_s:.1f}s block + {look_s:.1f}s lookahead + "
         f"{stream.preroll_s:.1f}s jitter + {proc:.1f}s inference; "
-        f"the {win_s:.1f}s window itself costs nothing)")
+        f"the {win_s:.1f}s window itself costs nothing)"
+    )
+
+
+def detent(pos, held, steps=POT_STEPS, hyst=POT_HYST):
+    """Snap position 0..1 to one of `steps` detents. `held` is the latched
+    index (None first time); noise below 0.5+hyst steps cannot dislodge it."""
+    x = min(max(pos, 0.0), 1.0) * steps
+    if held is None:
+        return int(round(x))
+    if abs(x - held) > 0.5 + hyst:
+        return int(min(max(round(x), 0), steps))
+    return held
 
 
 def pot_gain(pos):
@@ -391,6 +408,7 @@ class Ads1115:
 
     def __init__(self, bus, addr):
         import fcntl
+
         self.addr = addr
         self.fd = os.open("/dev/i2c-" + str(bus), os.O_RDWR)
         # I2C_SLAVE only latches the target address -- it never touches the
@@ -402,8 +420,7 @@ class Ads1115:
             os.read(self.fd, 2)
         except OSError:
             os.close(self.fd)
-            raise OSError("no ADS1115 answering at 0x%02x on i2c-%d"
-                          % (addr, bus))
+            raise OSError("no ADS1115 answering at 0x%02x on i2c-%d" % (addr, bus))
 
     def close(self):
         try:
@@ -419,16 +436,15 @@ class Ads1115:
         deadline = time.time() + 0.25
         while True:
             os.write(self.fd, bytes([ADS_REG_CONFIG]))
-            if os.read(self.fd, 2)[0] & 0x80:      # OS bit set = conversion done
+            if os.read(self.fd, 2)[0] & 0x80:  # OS bit set = conversion done
                 break
             if time.time() > deadline:
-                raise TimeoutError("0x%02x ch%d never finished"
-                                   % (self.addr, channel))
+                raise TimeoutError("0x%02x ch%d never finished" % (self.addr, channel))
             time.sleep(0.0005)
         os.write(self.fd, bytes([ADS_REG_CONV]))
         hi, lo = os.read(self.fd, 2)
         val = (hi << 8) | lo
-        if val & 0x8000:                           # 16-bit two's complement
+        if val & 0x8000:  # 16-bit two's complement
             val -= 0x10000
         return val
 
@@ -460,8 +476,10 @@ def pots(stream, stop, cfg, started=None):
         return
     want = len(SOURCES) + 1
     if len(chans) != want:
-        log("--pot-map lists %d faders, need %d (%s + master) -- faders off"
-            % (len(chans), want, " ".join(SOURCES)))
+        log(
+            "--pot-map lists %d faders, need %d (%s + master) -- faders off"
+            % (len(chans), want, " ".join(SOURCES))
+        )
         return
 
     boards = {}
@@ -477,22 +495,25 @@ def pots(stream, stop, cfg, started=None):
         return
 
     names = SOURCES + ["master"]
-    log("faders: " + "  ".join("%s=0x%02x:A%d" % (n, a, c)
-                               for n, (a, c) in zip(names, chans)))
-    log("unity at %.0f%% travel, %+.0fdB at the top, %.1fdB just above %.0f%%, "
+    log(
+        "faders: "
+        + "  ".join("%s=0x%02x:A%d" % (n, a, c) for n, (a, c) in zip(names, chans))
+    )
+    log(
+        "unity at %.0f%% travel, %+.0fdB at the top, %.1fdB just above %.0f%%, "
         "silent below that"
-        % (100 * POT_UNITY_POS, GAIN_MAX_DB, MUTE_FLOOR_DB,
-           100 * POT_MUTE_POS))
+        % (100 * POT_UNITY_POS, GAIN_MAX_DB, MUTE_FLOOR_DB, 100 * POT_MUTE_POS)
+    )
 
     viz = None
     if FaderViz is not None and cfg.get("viz", "auto") != "off":
         try:
-            viz = FaderViz(names, mode=cfg.get("viz", "auto"),
-                           unity_pos=POT_UNITY_POS)
-        except Exception as e:                    # never fatal
+            viz = FaderViz(names, mode=cfg.get("viz", "auto"), unity_pos=POT_UNITY_POS)
+        except Exception as e:  # never fatal
             log("fader display off (%s)" % e)
 
     smooth = [None] * len(chans)
+    latch = [None] * len(chans)  # detent index per fader
     shown = False
     sent = [None] * len(chans)
     period = 1.0 / max(cfg["hz"], 1e-3)
@@ -504,29 +525,34 @@ def pots(stream, stop, cfg, started=None):
                     raw = boards[addr].read_channel(chan)
                     volts = raw * ADS_FSR_VOLTS / 32768.0
                     pos = min(max(volts / cfg["vref"], 0.0), 1.0)
-                    smooth[i] = pos if smooth[i] is None else (
-                        smooth[i] + POT_SMOOTH * (pos - smooth[i]))
+                    smooth[i] = (
+                        pos
+                        if smooth[i] is None
+                        else (smooth[i] + POT_SMOOTH * (pos - smooth[i]))
+                    )
+                    latch[i] = detent(smooth[i], latch[i], cfg["steps"])
             except (OSError, TimeoutError) as e:
                 log("fader read failed (%s) -- holding the last gains" % e)
                 if viz is not None:
                     viz.invalidate()
                 time.sleep(0.5)
                 continue
-            # Only rebuild when something actually moved. The ADC jitters a
-            # couple of LSB even at rest, and rebuilding on that would churn
-            # the gain array under the writer for no audible reason.
-            moved = any(sent[i] is None
-                        or abs(smooth[i] - sent[i]) > POT_DEADBAND
-                        for i in range(len(chans)))
+            # Rebuild only when a detent actually changes -- the whole point
+            # of quantising is that a resting fader produces no updates.
+            quant = [d / cfg["steps"] for d in latch]
+            moved = any(
+                sent[i] is None or quant[i] != sent[i] for i in range(len(chans))
+            )
             if moved:
-                sent = list(smooth)
+                sent = quant
                 stream.set_positions(sent)
             # The display waits for playback to start: until then startup_bar()
             # owns the console, and two threads redrawing it just fight.
             if viz is not None and (started is None or started.is_set()):
                 if moved or not shown:
-                    viz.draw(sent, [stream.gain_map[s] for s in SOURCES]
-                                   + [stream.master])
+                    viz.draw(
+                        sent, [stream.gain_map[s] for s in SOURCES] + [stream.master]
+                    )
                     shown = True
             time.sleep(max(0.0, period - (time.time() - t0)))
     finally:
@@ -545,8 +571,20 @@ def read_audio(path, sr, ch):
     import time (for mp3 *writing*, which we never do), so it drags an extra
     native dependency onto the Pi for no benefit. ffmpeg is already required.
     """
-    cmd = ["ffmpeg", "-v", "quiet", "-i", str(path), "-f", "f32le",
-           "-ar", str(sr), "-ac", str(ch), "-"]
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "quiet",
+        "-i",
+        str(path),
+        "-f",
+        "f32le",
+        "-ar",
+        str(sr),
+        "-ac",
+        str(ch),
+        "-",
+    ]
     raw = subprocess.run(cmd, stdout=subprocess.PIPE, check=True).stdout
     a = np.frombuffer(raw, dtype="<f4").reshape(-1, ch).T
     return np.ascontiguousarray(a)
@@ -577,9 +615,7 @@ def run_offline(stream, in_file, out_file, sep):
     # output is bit-for-bit what the stream would produce. Trailing pad lets
     # the last real audio reach the emitted tail region.
     pad = stream.stride + stream.look + stream.xfade
-    wav = np.concatenate(
-        [wav, np.zeros((sep.ch, pad), dtype=np.float32)], axis=1
-    )
+    wav = np.concatenate([wav, np.zeros((sep.ch, pad), dtype=np.float32)], axis=1)
     for i in range(0, wav.shape[1], stream.stride):
         stream.feed(wav[:, i : i + stream.stride])
     stream.finish_input()
@@ -611,29 +647,62 @@ def _cap_pipe(fobj, nbytes, sep):
         fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, nbytes)
         after = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
     except (AttributeError, OSError) as e:
-        log(f"warning: could not resize the aplay pipe ({e}); "
-            "key response will lag by however much it holds")
+        log(
+            f"warning: could not resize the aplay pipe ({e}); "
+            "key response will lag by however much it holds"
+        )
         return None
-    log(f"aplay pipe {before} -> {after} bytes ({as_ms(before):.0f}ms -> "
-        f"{as_ms(after):.0f}ms of audio held at the old gain)")
+    log(
+        f"aplay pipe {before} -> {after} bytes ({as_ms(before):.0f}ms -> "
+        f"{as_ms(after):.0f}ms of audio held at the old gain)"
+    )
     return as_ms(after)
 
 
 def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
-    started = threading.Event()   # set by the writer when playback begins
+    started = threading.Event()  # set by the writer when playback begins
     rec = subprocess.Popen(
-        ["arecord", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
-         "-c", str(sep.ch), "-t", "raw", "--period-size", str(block)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        [
+            "arecord",
+            "-D",
+            device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(sep.sr),
+            "-c",
+            str(sep.ch),
+            "-t",
+            "raw",
+            "--period-size",
+            str(block),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
     # --buffer-time caps ALSA's own queue. Without it aplay can sit on a
     # second of audio, which would delay gain changes no matter how finely
     # we mix them.
     play = subprocess.Popen(
-        ["aplay", "-D", device, "-f", "S16_LE", "-r", str(sep.sr),
-         "-c", str(sep.ch), "-t", "raw",
-         "--buffer-time", "200000", "--period-time", "50000"],
-        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        [
+            "aplay",
+            "-D",
+            device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(sep.sr),
+            "-c",
+            str(sep.ch),
+            "-t",
+            "raw",
+            "--buffer-time",
+            "200000",
+            "--period-time",
+            "50000",
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
 
     # Shrink the OS pipe to aplay. The default on this Pi is 262144 bytes =
@@ -643,11 +712,14 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
     # instead of ~1.7s.
     try:
         import fcntl
+
         F_SETPIPE_SZ, F_GETPIPE_SZ = 1031, 1032
         fcntl.fcntl(play.stdin.fileno(), F_SETPIPE_SZ, 16384)
         got = fcntl.fcntl(play.stdin.fileno(), F_GETPIPE_SZ)
-        log(f"output pipe {got} bytes "
-            f"({1000*got/(sep.sr*sep.ch*2):.0f}ms committed)")
+        log(
+            f"output pipe {got} bytes "
+            f"({1000*got/(sep.sr*sep.ch*2):.0f}ms committed)"
+        )
     except Exception as e:
         log(f"could not shrink output pipe ({e}); key response will lag")
     # ...and the pipe INTO aplay needs the same treatment, for the same
@@ -662,9 +734,11 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
     pipe_ms = _cap_pipe(play.stdin, pipe_bytes, sep)
     if pipe_ms is not None:
         chunk_ms = chunk / sep.sr * 1000.0
-        log(f"fader response ~= {chunk_ms + pipe_ms + 200:.0f}ms "
+        log(
+            f"fader response ~= {chunk_ms + pipe_ms + 200:.0f}ms "
             f"({chunk_ms:.0f} mix chunk + {pipe_ms:.0f} pipe + 200 ALSA); "
-            "this is separate from the ~9.5s pipeline latency")
+            "this is separate from the ~9.5s pipeline latency"
+        )
 
     def reader():
         nbytes = block * sep.ch * 2
@@ -689,6 +763,7 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
         time.sleep(stream.preroll_s)
         started.set()
         buf = [first]
+
         def emit(blk):
             # Slice into small pieces and re-read the gains for each one.
             # Writing a whole 4s block at once would quantise gain changes to
@@ -712,9 +787,13 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
     stop = threading.Event()
     threads = [
         threading.Thread(target=f, daemon=True)
-        for f in (reader, stream.worker, writer,
-                  lambda: startup_bar(stream, sep, started),
-                  lambda: pots(stream, stop, pot_cfg, started))
+        for f in (
+            reader,
+            stream.worker,
+            writer,
+            lambda: startup_bar(stream, sep, started),
+            lambda: pots(stream, stop, pot_cfg, started),
+        )
     ]
     for t in threads:
         t.start()
@@ -752,93 +831,169 @@ def run_live(stream, sep, device, block, chunk, pipe_bytes, pot_cfg=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="simplified student .onnx")
-    ap.add_argument("--repo", default=str(Path(__file__).resolve().parent),
-                    help="dir containing vendor/ and profile/")
-    ap.add_argument("--threads", type=int, default=4,
-                    help="ORT threads. 1 was the optimisation target, but for "
-                         "live playback use the cores you have -- headroom "
-                         "against underruns beats a benchmark number")
-    ap.add_argument("--stride", type=float, default=4.0,
-                    help="seconds of audio emitted per model run. MUST exceed "
-                         "the per-window inference time (~3.1s on the Pi) or "
-                         "the stream falls behind permanently")
-    ap.add_argument("--lookahead", type=float, default=1.3,
-                    help="stop this far short of the window's right edge. "
-                         "Measured: the last 0.65s is ~7dB worse than centre, "
-                         "1.3s back recovers most of it")
-    ap.add_argument("--xfade", type=float, default=0.1,
-                    help="crossfade between consecutive blocks (they come from "
-                         "different model runs, so the join needs smoothing)")
-    ap.add_argument("--preroll", type=float, default=1.0,
-                    help="SECONDS of output buffered before playback starts. "
-                         "Jitter margin -- costs exactly its own value in "
-                         "latency, unlike buffering a whole block")
+    ap.add_argument(
+        "--repo",
+        default=str(Path(__file__).resolve().parent),
+        help="dir containing vendor/ and profile/",
+    )
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=4,
+        help="ORT threads. 1 was the optimisation target, but for "
+        "live playback use the cores you have -- headroom "
+        "against underruns beats a benchmark number",
+    )
+    ap.add_argument(
+        "--stride",
+        type=float,
+        default=4.0,
+        help="seconds of audio emitted per model run. MUST exceed "
+        "the per-window inference time (~3.1s on the Pi) or "
+        "the stream falls behind permanently",
+    )
+    ap.add_argument(
+        "--lookahead",
+        type=float,
+        default=1.3,
+        help="stop this far short of the window's right edge. "
+        "Measured: the last 0.65s is ~7dB worse than centre, "
+        "1.3s back recovers most of it",
+    )
+    ap.add_argument(
+        "--xfade",
+        type=float,
+        default=0.1,
+        help="crossfade between consecutive blocks (they come from "
+        "different model runs, so the join needs smoothing)",
+    )
+    ap.add_argument(
+        "--preroll",
+        type=float,
+        default=1.0,
+        help="SECONDS of output buffered before playback starts. "
+        "Jitter margin -- costs exactly its own value in "
+        "latency, unlike buffering a whole block",
+    )
     ap.add_argument("--device", default="plughw:CARD=Zero,DEV=0")
-    ap.add_argument("--block", type=int, default=4096,
-                    help="capture read size (samples)")
-    ap.add_argument("--out-chunk", type=int, default=2048,
-                    help="playback mix granularity (samples). Gains are "
-                         "re-read per chunk, so this sets how fast the keys "
-                         "respond: 2048 @ 44.1kHz = 46ms")
-    ap.add_argument("--pipe-bytes", type=int, default=16384,
-                    help="cap on the pipe into aplay. This is finished PCM, "
-                         "so it delays key response 1:1: 16384 @ 44.1kHz "
-                         "stereo = 93ms. Raise it if you get underruns")
-    ap.add_argument("--pot-map", default=POT_MAP_DEFAULT,
-                    help="fader -> ADC channel map, in the order "
-                         + " ".join(SOURCES) + " master. Addresses come from "
-                         "the ADS1115 ADDR pin: GND=0x48, VDD=0x49")
-    ap.add_argument("--pot-bus", type=int, default=1,
-                    help="i2c bus. The DA7212 codec shares it at 0x1a, which "
-                         "is fine -- i2c is a bus and 0x48/0x49 do not collide")
-    ap.add_argument("--pot-vref", type=float, default=3.295,
-                    help="volts at the top of fader travel, i.e. what counts "
-                         "as unity*max. Measured 3.295 on this rig, not 3.300; "
-                         "read it off five_pot_test.py and set it here")
-    ap.add_argument("--pot-hz", type=float, default=20.0,
-                    help="fader poll rate. A 5-fader scan takes ~40ms at "
-                         "128 SPS, so much above 20 just spins")
-    ap.add_argument("--fader-viz", default="auto",
-                    choices=("auto", "ansi", "plain", "off"),
-                    help="live fader bars. auto picks ansi only on a tty, and "
-                         "`ssh host cmd` is not one -- pass ansi explicitly if "
-                         "a real terminal is reading the other end of the pipe")
-    ap.add_argument("--no-pots", action="store_true",
-                    help="ignore the faders and keep the command-line gains")
+    ap.add_argument(
+        "--block", type=int, default=4096, help="capture read size (samples)"
+    )
+    ap.add_argument(
+        "--out-chunk",
+        type=int,
+        default=2048,
+        help="playback mix granularity (samples). Gains are "
+        "re-read per chunk, so this sets how fast the keys "
+        "respond: 2048 @ 44.1kHz = 46ms",
+    )
+    ap.add_argument(
+        "--pipe-bytes",
+        type=int,
+        default=16384,
+        help="cap on the pipe into aplay. This is finished PCM, "
+        "so it delays key response 1:1: 16384 @ 44.1kHz "
+        "stereo = 93ms. Raise it if you get underruns",
+    )
+    ap.add_argument(
+        "--pot-map",
+        default=POT_MAP_DEFAULT,
+        help="fader -> ADC channel map, in the order "
+        + " ".join(SOURCES)
+        + " master. Addresses come from "
+        "the ADS1115 ADDR pin: GND=0x48, VDD=0x49",
+    )
+    ap.add_argument(
+        "--pot-bus",
+        type=int,
+        default=1,
+        help="i2c bus. The DA7212 codec shares it at 0x1a, which "
+        "is fine -- i2c is a bus and 0x48/0x49 do not collide",
+    )
+    ap.add_argument(
+        "--pot-vref",
+        type=float,
+        default=3.295,
+        help="volts at the top of fader travel, i.e. what counts "
+        "as unity*max. Measured 3.295 on this rig, not 3.300; "
+        "read it off five_pot_test.py and set it here",
+    )
+    ap.add_argument(
+        "--pot-steps",
+        type=int,
+        default=POT_STEPS,
+        help="detents across the travel (20 = 5%% each)",
+    )
+    ap.add_argument(
+        "--pot-hz",
+        type=float,
+        default=20.0,
+        help="fader poll rate. A 5-fader scan takes ~40ms at "
+        "128 SPS, so much above 20 just spins",
+    )
+    ap.add_argument(
+        "--fader-viz",
+        default="auto",
+        choices=("auto", "ansi", "plain", "off"),
+        help="live fader bars. auto picks ansi only on a tty, and "
+        "`ssh host cmd` is not one -- pass ansi explicitly if "
+        "a real terminal is reading the other end of the pipe",
+    )
+    ap.add_argument(
+        "--no-pots",
+        action="store_true",
+        help="ignore the faders and keep the command-line gains",
+    )
     ap.add_argument("--in-file", default="")
     ap.add_argument("--out-file", default="")
     for s in SOURCES:
-        ap.add_argument(f"--{s}", type=float, default=GAINS[s],
-                        help=f"gain for {s} (0 mutes it)")
+        ap.add_argument(
+            f"--{s}", type=float, default=GAINS[s], help=f"gain for {s} (0 mutes it)"
+        )
     args = ap.parse_args()
 
     gains = {s: getattr(args, s) for s in SOURCES}
     log(f"stem gains: {gains}")
 
     sep = Separator(args.model, args.repo, threads=args.threads)
-    stream = Stream(sep, gains, args.stride, args.lookahead, args.xfade,
-                    args.preroll)
+    stream = Stream(sep, gains, args.stride, args.lookahead, args.xfade, args.preroll)
     log(
         f"window {stream.win/sep.sr:.2f}s (all lookback)  "
         f"stride {args.stride:.2f}s  lookahead {args.lookahead:.2f}s  "
         f"xfade {args.xfade:.2f}s  preroll {args.preroll:.2f}s  "
         f"threads {args.threads}"
     )
-    log(f"expected latency ~= proc + {args.stride + args.lookahead + args.preroll:.1f}s"
-        f"  (proc measured after the first block)")
+    log(
+        f"expected latency ~= proc + {args.stride + args.lookahead + args.preroll:.1f}s"
+        f"  (proc measured after the first block)"
+    )
 
     if args.in_file:
         if not args.out_file:
             sys.exit("--in-file needs --out-file")
         run_offline(stream, args.in_file, args.out_file, sep)
     else:
-        pot_cfg = None if args.no_pots else {
-            "map": args.pot_map, "bus": args.pot_bus,
-            "vref": args.pot_vref, "hz": args.pot_hz,
-            "viz": args.fader_viz,
-        }
-        run_live(stream, sep, args.device, args.block, args.out_chunk,
-                 args.pipe_bytes, pot_cfg)
+        pot_cfg = (
+            None
+            if args.no_pots
+            else {
+                "map": args.pot_map,
+                "bus": args.pot_bus,
+                "vref": args.pot_vref,
+                "hz": args.pot_hz,
+                "steps": args.pot_steps,
+                "viz": args.fader_viz,
+            }
+        )
+        run_live(
+            stream,
+            sep,
+            args.device,
+            args.block,
+            args.out_chunk,
+            args.pipe_bytes,
+            pot_cfg,
+        )
 
 
 if __name__ == "__main__":
