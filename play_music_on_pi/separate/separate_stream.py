@@ -187,7 +187,9 @@ class Stream:
         they meet at a seam. We compute a little extra and crossfade the join.
     """
 
-    def __init__(self, sep, gains, stride_s, lookahead_s, xfade_s, preroll_s):
+    def __init__(
+        self, sep, gains, stride_s, lookahead_s, xfade_s, preroll_s, max_lag_s=None
+    ):
         self.sep = sep
         self.win = sep.win
         sr = sep.sr
@@ -223,6 +225,12 @@ class Stream:
         self.held = None  # xfade tail from the last block
         f = np.linspace(0.0, 1.0, self.xfade, dtype=np.float32)[None, :]
         self.fade_in, self.fade_out = f, 1.0 - f
+
+        # Backlog bound. Without it a worker that ever runs slower than
+        # realtime falls further behind every window and never recovers, since
+        # next_end only ever advances by one stride. None = never drop (offline).
+        self.max_lag = None if max_lag_s is None else int(max_lag_s * sep.sr)
+        self.dropped = 0
 
         self.processed = 0
         self.t_proc = 0.0
@@ -276,6 +284,18 @@ class Stream:
                     self.incond.wait(timeout=0.5)
                 if not have():
                     break  # input ended mid-window
+                newest = self.base + self.inbuf.shape[1]
+                if self.max_lag is not None and newest - self.next_end > self.max_lag:
+                    # Too far behind: jump to the newest complete window and
+                    # discard the backlog. Drops audio, but bounded latency is
+                    # the point of a live monitor.
+                    skip = newest - self.next_end
+                    self.dropped += skip
+                    self.next_end = newest
+                    log(
+                        "behind -- skipped %.2fs to stay current (%.1fs total)"
+                        % (skip / self.sep.sr, self.dropped / self.sep.sr)
+                    )
                 end = self.next_end
                 st = end - self.win - self.base
                 window = self.inbuf[:, st : st + self.win].copy()
@@ -868,6 +888,13 @@ def main():
         "different model runs, so the join needs smoothing)",
     )
     ap.add_argument(
+        "--max-lag",
+        type=float,
+        default=2.0,
+        help="seconds of backlog before stale audio is dropped to stay "
+        "current. Live only -- offline never drops",
+    )
+    ap.add_argument(
         "--preroll",
         type=float,
         default=1.0,
@@ -956,7 +983,15 @@ def main():
     log(f"stem gains: {gains}")
 
     sep = Separator(args.model, args.repo, threads=args.threads)
-    stream = Stream(sep, gains, args.stride, args.lookahead, args.xfade, args.preroll)
+    stream = Stream(
+        sep,
+        gains,
+        args.stride,
+        args.lookahead,
+        args.xfade,
+        args.preroll,
+        max_lag_s=None if args.in_file else args.max_lag,
+    )
     log(
         f"window {stream.win/sep.sr:.2f}s (all lookback)  "
         f"stride {args.stride:.2f}s  lookahead {args.lookahead:.2f}s  "
