@@ -3,3 +3,6 @@ Do not touch the hat/pi with bare hands while on
 
 Use the provided connector to pass the 40 pin out above the hat
  - don't attach the da7212 rpi5 hat directly, it eats up the 40 pin
+
+The Pi overheats easily under load w/ 2-4 cores active
+ - tried the armorlite v5 cooler
