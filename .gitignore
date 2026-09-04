@@ -44,3 +44,6 @@ nohup.out
 # NOTE: pi_optimize_demucs/logs/ is deliberately NOT ignored. Those are small
 # text files and they are the record of the 18h training run (SDR curve, the
 # quantization OOM traces) that FINDINGS.md refers to.
+
+# PCB design
+pcb/KiCAD-MCP-Server
