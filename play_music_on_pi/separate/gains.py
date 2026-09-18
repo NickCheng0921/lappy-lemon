@@ -33,7 +33,10 @@ SOURCES = ["drums", "bass", "other", "vocals"]
 # Five slide pots on two ADS1115s (4 channels each, addresses set by the ADDR
 # pin: GND=0x48, VDD=0x49). Unused ADC channels must be tied to GND -- a
 # floating input reads as a convincing mid-scale position, not as zero.
-POT_MAP_DEFAULT = "0x48:0,1,2,3 0x49:0"
+# The map is listed in SOURCES order (drums, bass, other, vocals) but the
+# panel is laid out vocals-first, left to right: A0=vocals, A1=drums,
+# A2=bass, A3=other, and the master on the second board.
+POT_MAP_DEFAULT = "0x48:1,2,3,0 0x49:0"
 POT_UNITY_POS = 0.80  # travel fraction that means unity gain
 POT_MUTE_POS = 0.02  # below this a fader is off, not merely quiet
 POT_SMOOTH = 0.5  # one-pole EMA on position; 1.0 disables smoothing

@@ -19,7 +19,10 @@ try:
 except ImportError:  # display is cosmetic; the app is not
     FaderViz = None
 
-POT_MAP_DEFAULT = "0x48:0,1,2,3 0x49:0"
+# The map is listed in SOURCES order (drums, bass, other, vocals) but the
+# panel is laid out vocals-first, left to right: A0=vocals, A1=drums,
+# A2=bass, A3=other, and the master on the second board.
+POT_MAP_DEFAULT = "0x48:1,2,3,0 0x49:0"
 
 POT_SMOOTH = 0.5  # one-pole EMA on position; 1.0 disables smoothing
 
