@@ -45,5 +45,19 @@ nohup.out
 # text files and they are the record of the 18h training run (SDR curve, the
 # quantization OOM traces) that FINDINGS.md refers to.
 
-# PCB design
-pcb/KiCAD-MCP-Server
+# AI Tooling
+CLAUDE.md
+.mcp.json
+
+# Notes + Artifacts
+pi_optimize_demucs/*.md
+pi_optimize_demucs/logs
+pi_optimize_demucs/*.sh
+play_music_on_pi/*.txt
+play_music_on_pi/plot_temp.py
+play_music_on_pi/passthrough/
+profile/info.txt
+demucs_info.txt
+
+# PCB creation
+pcb/

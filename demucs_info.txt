@@ -12,8 +12,17 @@ Model args:
     - 0.25 DB boost
  overlap: 0.25
  split: true
-Default segment length is 10 seconds from htdemucs.py:131
+Segment length: htdemucs.py:131 sets constructor default = 10s, BUT the loaded
+htdemucs checkpoint overrides this to its trained value = 39/5 = 7.8s
+(via use_train_segment). CLI --segment has no default (separate.py:63), so the
+run used 7.8s windows. CLI forbids segment > trained value for transformer
+models (separate.py:129-136). This is the "8.8 dB @ 7.8s" from the paper.
  - right pad w/ 0 at inference, htdmeucs.py:530-537
+
+Params vs file size: base htdemucs = single model, ~41.98M params.
+ - checkpoint on disk (fp16): ~80 MB  (42M * 2 bytes)  <- the "80" number
+ - loaded in fp32 (RAM): ~168 MB
+ - htdemucs_ft = 4 submodels, ~168M params total (the real >80M-param model)
 
 separate.py defaults
     samplerate 44.1KHz
@@ -25,4 +34,6 @@ mp3 input as file path
 api.py -> separate_audio_file 
 calls separate_tensor on _load_audio
 weighted label is used, output is most accurate in middle of window
- - middle peak is segment samples // 2, 220K for this
+ - triangular weight: 1 at edges, peak = segment_samples // 2 in the middle
+ - 7.8s * 44100 = 343980 samples -> peak = 343980 // 2 = 171990
+ - (would be 220500 only if segment were 10s; actual is 7.8s)
