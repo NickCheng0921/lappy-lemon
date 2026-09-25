@@ -1,0 +1,12 @@
+# Harness env. Demucs is invoked as a CLI and pulls torch; if that is too heavy
+# to share, install demucs in its own venv and put it on PATH instead.
+numpy
+scipy
+soundfile
+librosa
+museval
+pandas
+pyarrow
+tabulate
+matplotlib
+demucs
