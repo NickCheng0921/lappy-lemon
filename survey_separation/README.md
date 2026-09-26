@@ -28,6 +28,14 @@ Per-stem median over tracks, then reported as `median / mean` across the 50
 tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
 hard tracks (e.g. near-silent bass) drag it down without moving the median.
 
+**[Published Values](https://huggingface.co/datasets/StemSplitio/stem-separation-benchmark-2026) - 4stem (median SDR, dB)**
+| model_id         |  bass |  drums | other | vocals |
+|:-----------------|------:|-------:|------:|-------:|
+| htdemucs         |  9.78 |  10.01 |  6.42 |   8.53 |
+| htdemucs_ft      | 10.38 |  10.11 |  6.34 |   9.19 |
+
+Published figures on lossless MUSDB18-HQ. Collected metrics are on compressed mp4 MUSDB18 (decoded from `.stem.mp4`) with a 1.0 s window, so it sits a touch lower.
+
 ## Ingestion, by tool
 | Tool           | How stems arrive                          | Profiles      |
 |----------------|-------------------------------------------|---------------|
