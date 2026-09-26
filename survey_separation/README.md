@@ -8,9 +8,25 @@ benchmark/     tool-agnostic harness (IO, alignment, museval, aggregation, CLI)
 separators/    one subpackage per tool; each exposes build() -> Separator
 ```
 
-## Design in one line
-Adapters only *produce* stems (or ingest human-rendered / captured ones);
-everything downstream sees a uniform `StemSet` and never knows which tool made it.
+## Results
+
+MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
+
+**4stem — SDR (dB)**
+| separator   | bass (med / mean) | drums (med / mean) | other (med / mean) | vocals (med / mean) |
+|:------------|:-----------------:|:------------------:|:------------------:|:-------------------:|
+| htdemucs    |   10.22 / 9.11    |    9.98 / 10.20    |    6.48 / 6.11     |    8.66 / 7.78      |
+| htdemucs_ft |   10.34 / 9.37    |   10.22 / 10.41    |    6.37 / 6.01     |    8.79 / 8.11      |
+
+**2stem — SDR (dB)**
+| separator   | accompaniment (med / mean) | vocals (med / mean) |
+|:------------|:--------------------------:|:-------------------:|
+| htdemucs    |       15.05 / 14.70        |    8.72 / 7.86      |
+| htdemucs_ft |       14.33 / 13.85        |    8.85 / 8.16      |
+
+Per-stem median over tracks, then reported as `median / mean` across the 50
+tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
+hard tracks (e.g. near-silent bass) drag it down without moving the median.
 
 ## Ingestion, by tool
 | Tool           | How stems arrive                          | Profiles      |
