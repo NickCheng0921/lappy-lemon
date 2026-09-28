@@ -1,12 +1,6 @@
 # survey_separation
 
-Benchmark harness for music stem-separation tools on MUSDB18-HQ, scored with
-BSS Eval v4 (museval). Datasets live **outside** this tree.
-
-```
-benchmark/     tool-agnostic harness (IO, alignment, museval, aggregation, CLI)
-separators/    one subpackage per tool; each exposes build() -> Separator
-```
+Compare performance of stem splitting tools available (2026)
 
 ## Results
 
@@ -17,12 +11,6 @@ MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
 |:------------|:-----------------:|:------------------:|:------------------:|:-------------------:|
 | htdemucs    |   10.22 / 9.11    |    9.98 / 10.20    |    6.48 / 6.11     |    8.66 / 7.78      |
 | htdemucs_ft |   10.34 / 9.37    |   10.22 / 10.41    |    6.37 / 6.01     |    8.79 / 8.11      |
-
-**2stem — SDR (dB)**
-| separator   | accompaniment (med / mean) | vocals (med / mean) |
-|:------------|:--------------------------:|:-------------------:|
-| htdemucs    |       15.05 / 14.70        |    8.72 / 7.86      |
-| htdemucs_ft |       14.33 / 13.85        |    8.85 / 8.16      |
 
 Per-stem median over tracks, then reported as `median / mean` across the 50
 tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
@@ -37,23 +25,17 @@ hard tracks (e.g. near-silent bass) drag it down without moving the median.
 Published figures on lossless MUSDB18-HQ. Collected metrics are on compressed mp4 MUSDB18 (decoded from `.stem.mp4`) with a 1.0 s window, so it sits a touch lower.
 
 ## Ingestion, by tool
-| Tool           | How stems arrive                          | Profiles      |
-|----------------|-------------------------------------------|---------------|
-| htdemucs       | `demucs` CLI (auto)                       | 4stem, 2stem  |
-| htdemucs_ft    | `demucs` CLI (auto)                       | 4stem, 2stem  |
-| spleeter       | `spleeter` CLI, separate venv (auto)      | 4stem, 2stem  |
-| flstudio       | GUI export -> `flstudio/inbox/<id>/`      | 4stem, 2stem  |
-| virtualdj      | export -> `virtualdj/inbox/<id>/`         | 2stem         |
-| jbl_bandbox (planned)    | loopback capture -> `jbl_bandbox/captures/<id>/` | 2stem  |
+| Tool           | How stems arrive                          |
+|----------------|-------------------------------------------|
+| htdemucs       | `demucs` CLI (auto)                       |
+| htdemucs_ft    | `demucs` CLI (auto)                       |
+| spleeter       | `spleeter` CLI, separate venv (auto)      |
+| flstudio       | GUI export -> `flstudio/inbox/<id>/`      |
+| virtualdj      | export -> `virtualdj/inbox/<id>/`         |
+| jbl_bandbox (planned)    | loopback capture -> `jbl_bandbox/captures/<id>/` |
 
 `<id>` = MUSDB track folder name. Manual/capture stems that aren't present yet
 are listed in `runs/<run>/pending.json` instead of failing the run.
-
-## Profiles
-- **4stem**: vocals/drums/bass/other (Demucs, Spleeter, FL Studio).
-- **2stem**: vocals vs accompaniment — the only apples-to-apples axis across
-  *every* tool. Reference accompaniment is summed from drums+bass+other; a
-  4-stem tool's accompaniment is summed from its own three non-vocal stems.
 
 ## Run
 ```bash
