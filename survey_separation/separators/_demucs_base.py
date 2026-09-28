@@ -15,7 +15,10 @@ class DemucsSeparator(Separator):
         self.model = model
 
     def resolve(self, track, workdir):
-        out_root = Path(workdir) / self.name
+        # Per-track out_root: every MUSDB mixture file is named "mixture.wav", so
+        # keying on track.mixture.stem would collide across tracks and make the
+        # cache check reuse the first track's stems for all of them.
+        out_root = Path(workdir) / self.name / track.id
         # demucs writes <out_root>/<model>/<mixture_stem>/{stem}.wav
         stem_dir = out_root / self.model / track.mixture.stem
         if not all((stem_dir / f"{s}.wav").exists() for s in CANONICAL):
