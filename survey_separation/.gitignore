@@ -3,3 +3,7 @@ CLAUDE.md
 
 # Artifacts
 runs
+*.log
+
+# Scratch drivers for running one separator at a time
+_run_*_tmp.py
