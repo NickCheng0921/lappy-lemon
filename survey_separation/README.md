@@ -11,6 +11,7 @@ MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
 |:------------|:-----------------:|:------------------:|:------------------:|:-------------------:|
 | htdemucs    |   10.22 / 9.11    |    9.98 / 10.20    |    6.48 / 6.11     |    8.66 / 7.78      |
 | htdemucs_ft |   10.34 / 9.37    |   10.22 / 10.41    |    6.37 / 6.01     |    8.79 / 8.11      |
+| virtualdj   |    8.98 / 8.00    |    9.61 / 10.06    |    6.20 / 5.76     |   10.06 / 9.53      |
 
 Per-stem median over tracks, then reported as `median / mean` across the 50
 tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
