@@ -6,6 +6,24 @@ Compare performance of stem splitting tools available (2026)
 
 MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
 
+### Metric: SDR
+
+SDR (Signal-to-Distortion Ratio) is the metric from [BSS Eval v4](https://sigsep.github.io/sigsep-mus-eval/).
+It represents the ratio between the true stem track and the amount of error the
+separation model adds.
+
+$$\mathrm{SDR} = 10\,\log_{10}\frac{\lVert s_{\text{target}}\rVert^2}{\lVert e_{\text{spat}} + e_{\text{interf}} + e_{\text{artif}}\rVert^2}\quad[\text{dB}]$$
+
+<sub>— [signal vs. spatial + interference + artifact error, BSS Eval v4](https://github.com/sigsep/sigsep-mus-eval/blob/master/museval/metrics.py)</sub>
+
+A 3 dB improvement equates to ~2× cleaner separation:
+
+$$10^{3/10} \approx 2$$
+
+For example, the distilled htdemucs model gets 5.76 dB on vocals versus 8.79 dB
+for htdemucs_ft — a 3.0 dB gap, so it leaves roughly **2× the error energy** in
+the vocal stem (the cost of shrinking 42M → 8.8M params for the Pi).
+
 **4stem — SDR (dB)**
 | separator   | bass (med / mean) | drums (med / mean) | other (med / mean) | vocals (med / mean) |
 |:------------|:-----------------:|:------------------:|:------------------:|:-------------------:|
