@@ -6,23 +6,14 @@ Compare performance of stem splitting tools available (2026)
 
 MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
 
-### Metric: SDR
-
-SDR (Signal-to-Distortion Ratio) is the metric from [BSS Eval v4](https://sigsep.github.io/sigsep-mus-eval/).
-It represents the ratio between the true stem track and the amount of error the
+SDR (Signal-to-Distortion Ratio) is the class of metric used to judge separation quality, implementation from BSS Eval v4. SDR represents the ratio between the true stem track and the amount of error the
 separation model adds.
 
 $$\mathrm{SDR} = 10\,\log_{10}\frac{\lVert s_{\text{target}}\rVert^2}{\lVert e_{\text{spat}} + e_{\text{interf}} + e_{\text{artif}}\rVert^2}\quad[\text{dB}]$$
 
-<sub>— [signal vs. spatial + interference + artifact error, BSS Eval v4](https://github.com/sigsep/sigsep-mus-eval/blob/master/museval/metrics.py)</sub>
+<sub>  [signal vs. spatial + interference + artifact error, BSS Eval v4](https://github.com/sigsep/sigsep-mus-eval/blob/master/museval/metrics.py)</sub>
 
-A 3 dB improvement equates to ~2× cleaner separation:
-
-$$10^{3/10} \approx 2$$
-
-For example, the distilled htdemucs model gets 5.76 dB on vocals versus 8.79 dB
-for htdemucs_ft — a 3.0 dB gap, so it leaves roughly **2× the error energy** in
-the vocal stem (the cost of shrinking 42M → 8.8M params for the Pi).
+For example, a 3 dB improvement equates to ~2× cleaner separation: $10^{3/10} \approx 2$.
 
 **4stem — SDR (dB)**
 | separator   | bass (med / mean) | drums (med / mean) | other (med / mean) | vocals (med / mean) |
@@ -32,9 +23,7 @@ the vocal stem (the cost of shrinking 42M → 8.8M params for the Pi).
 | virtualdj   |    8.98 / 8.00    |    9.61 / 10.06    |    6.20 / 5.76     |   10.06 / 9.53      |
 | htdemucs_distill |    5.65 / 4.63    |    5.70 / 6.15     |    4.03 / 3.66     |    5.76 / 5.31      |
 
-Per-stem median over tracks, then reported as `median / mean` across the 50
-tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
-hard tracks (e.g. near-silent bass) drag it down without moving the median.
+<sub>htdemucs_distill is a 8.8M distillation of the 42M htdemucs model targetting a rpi 5
 
 **[Published Values](https://huggingface.co/datasets/StemSplitio/stem-separation-benchmark-2026) - 4stem (median SDR, dB)**
 | model_id         |  bass |  drums | other | vocals |
