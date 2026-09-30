@@ -23,7 +23,7 @@ For example, a 3 dB improvement equates to ~2× cleaner separation: $10^{3/10} \
 | virtualdj   |    8.98 / 8.00    |    9.61 / 10.06    |    6.20 / 5.76     |   10.06 / 9.53      |
 | htdemucs_distill |    5.65 / 4.63    |    5.70 / 6.15     |    4.03 / 3.66     |    5.76 / 5.31      |
 
-<sub>htdemucs_distill is a 8.8M distillation of the 42M htdemucs model targetting a rpi 5
+<sub>htdemucs_distill is a 8.8M distillation of the 42M htdemucs model targetting a rpi 5</sub>
 
 **[Published Values](https://huggingface.co/datasets/StemSplitio/stem-separation-benchmark-2026) - 4stem (median SDR, dB)**
 | model_id         |  bass |  drums | other | vocals |
