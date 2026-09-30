@@ -6,15 +6,24 @@ Compare performance of stem splitting tools available (2026)
 
 MUSDB18 test set (50 tracks), BSS Eval v4, 1.0 s window.
 
+SDR (Signal-to-Distortion Ratio) is the class of metric used to judge separation quality, implementation from BSS Eval v4. SDR represents the ratio between the true stem track and the amount of error the
+separation model adds.
+
+$$\mathrm{SDR} = 10\,\log_{10}\frac{\lVert s_{\text{target}}\rVert^2}{\lVert e_{\text{spat}} + e_{\text{interf}} + e_{\text{artif}}\rVert^2}\quad[\text{dB}]$$
+
+<sub>  [signal vs. spatial + interference + artifact error, BSS Eval v4](https://github.com/sigsep/sigsep-mus-eval/blob/master/museval/metrics.py)</sub>
+
+For example, a 3 dB improvement equates to ~2× cleaner separation: $10^{3/10} \approx 2$.
+
 **4stem — SDR (dB)**
 | separator   | bass (med / mean) | drums (med / mean) | other (med / mean) | vocals (med / mean) |
 |:------------|:-----------------:|:------------------:|:------------------:|:-------------------:|
 | htdemucs    |   10.22 / 9.11    |    9.98 / 10.20    |    6.48 / 6.11     |    8.66 / 7.78      |
 | htdemucs_ft |   10.34 / 9.37    |   10.22 / 10.41    |    6.37 / 6.01     |    8.79 / 8.11      |
+| virtualdj   |    8.98 / 8.00    |    9.61 / 10.06    |    6.20 / 5.76     |   10.06 / 9.53      |
+| htdemucs_distill |    5.65 / 4.63    |    5.70 / 6.15     |    4.03 / 3.66     |    5.76 / 5.31      |
 
-Per-stem median over tracks, then reported as `median / mean` across the 50
-tracks. Median is the SiSEC/MUSDB headline; the mean sits lower because a few
-hard tracks (e.g. near-silent bass) drag it down without moving the median.
+<sub>htdemucs_distill is a 8.8M distillation of the 42M htdemucs model targetting a rpi 5</sub>
 
 **[Published Values](https://huggingface.co/datasets/StemSplitio/stem-separation-benchmark-2026) - 4stem (median SDR, dB)**
 | model_id         |  bass |  drums | other | vocals |
