@@ -29,14 +29,14 @@ fi
 echo "== using $PI_HOST"
 
 echo "== system packages, i2c"
-$PI "sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv ffmpeg unzip alsa-utils i2c-tools \
+$PI "sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv ffmpeg unzip alsa-utils i2c-tools sox \
   && sudo raspi-config nonint do_i2c 0 && sudo usermod -aG i2c,audio \$USER"
 
 echo "== code"
 tar czf /tmp/lappy_src.tgz --exclude=__pycache__ vendor/demucs profile/onnx_export.py \
-    -C play_music_on_pi separate \
+    -C play_music_on_pi separate passthrough/passthrough.sh passthrough/delay.sh passthrough/chorus.sh \
     -C ../$(dirname $STUBS) stubs
-$PI "mkdir -p ~/demucs_opt && cd ~/demucs_opt && tar xzf -" < /tmp/lappy_src.tgz
+$PI "mkdir -p ~/demucs_opt && cd ~/demucs_opt && tar xzf - && sed -i 's/\r$//' passthrough/*.sh && chmod +x passthrough/*.sh" < /tmp/lappy_src.tgz
 
 echo "== model"
 $PI "cat > ~/demucs_opt/student_final_slim.onnx" < $MODEL
@@ -50,12 +50,19 @@ $PI "cd ~/demucs_opt && { [ -d .venv ] || python3 -m venv .venv; } \
   && .venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu \
   && .venv/bin/pip install -q onnxruntime numpy einops julius omegaconf dora-search tqdm soundfile"
 
-echo "== DA7212 mixer (Waveshare state, then 40% out)"
+echo "== DA7212 mixer (Waveshare state, mics off, Aux 0dB, 40% out)"
 $PI "cd ~ && [ -d da7212-config ] || { wget -q 'https://gitee.com/waveshare/DA7212-Audio-Board-A/raw/master/examples/DA7212-Audio-Board-A-Config.zip' \
   && unzip -q DA7212-Audio-Board-A-Config.zip -d da7212-config; } \
   ; sudo alsactl restore -f da7212-config/All-input-output.state; \
+  for m in 'Mixin Left Mic 1' 'Mixin Left Mic 2' 'Mixin Right Mic 1' 'Mixin Right Mic 2' 'Onboard MIC' 'MIC Jack'; do \
+    amixer -q -c Zero sset \"\$m\" off; done; \
+  amixer -q -c Zero sset 'Mic 1' 0% off; amixer -q -c Zero sset 'Mic 2' 0% off; amixer -q -c Zero sset Aux 0dB; \
   amixer -q -c Zero sset Headphone 40% && amixer -q -c Zero sset Lineout 40% && sudo alsactl store" \
   || echo "!! mixer step failed -- is the HAT detected? (aplay -l)"
+
+echo "== boot service (enabled, not started)"
+$PI "sudo cp ~/demucs_opt/separate/lappy-separate.service /etc/systemd/system/ \
+  && sudo systemctl daemon-reload && sudo systemctl enable lappy-separate"
 
 echo "== checks"
 $PI "tr -d '\0' < /proc/device-tree/hat/product; echo; aplay -l | grep -i zero || echo '!! no Zero card'; \
