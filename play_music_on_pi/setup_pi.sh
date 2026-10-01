@@ -20,6 +20,14 @@ STUBS=survey_separation/separators/htdemucs_distill/stubs
 
 [[ -f $MODEL ]] || { echo "missing $MODEL (gitignored; restore from backup)"; exit 1; }
 
+# mDNS drops mid-run (the model transfer especially); resolve once, pin the IP.
+if [[ ${PI_HOST:-nickpi.local} == *.local ]]; then
+    ip=$($PI "hostname -I" | awk '{print $1}')
+    [[ -n $ip ]] || { echo "can't reach ${PI_HOST:-nickpi.local}; pass PI_HOST=<ip>"; exit 1; }
+    export PI_HOST=$ip
+fi
+echo "== using $PI_HOST"
+
 echo "== system packages, i2c"
 $PI "sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv ffmpeg unzip alsa-utils i2c-tools \
   && sudo raspi-config nonint do_i2c 0 && sudo usermod -aG i2c,audio \$USER"
@@ -45,8 +53,8 @@ $PI "cd ~/demucs_opt && { [ -d .venv ] || python3 -m venv .venv; } \
 echo "== DA7212 mixer (Waveshare state, then 40% out)"
 $PI "cd ~ && [ -d da7212-config ] || { wget -q 'https://gitee.com/waveshare/DA7212-Audio-Board-A/raw/master/examples/DA7212-Audio-Board-A-Config.zip' \
   && unzip -q DA7212-Audio-Board-A-Config.zip -d da7212-config; } \
-  && sudo alsactl restore -f da7212-config/All-input-output.state \
-  && amixer -q -c Zero sset Headphone 40% && amixer -q -c Zero sset Lineout 40% && sudo alsactl store" \
+  ; sudo alsactl restore -f da7212-config/All-input-output.state; \
+  amixer -q -c Zero sset Headphone 40% && amixer -q -c Zero sset Lineout 40% && sudo alsactl store" \
   || echo "!! mixer step failed -- is the HAT detected? (aplay -l)"
 
 echo "== checks"
