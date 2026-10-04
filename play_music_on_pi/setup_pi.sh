@@ -3,17 +3,23 @@
 # Rebuild ~/demucs_opt on a freshly flashed Pi, from the laptop.
 #
 # Run from the repo root:
-#   PI_HOST=<ip> bash play_music_on_pi/setup_pi.sh
+#   bash play_music_on_pi/setup_pi.sh
+#   PI_HOST=<ip> PI_USER=<user> bash play_music_on_pi/setup_pi.sh
+#
+#   PI_HOST   hostname or IP (default: nickpi.local)
+#   PI_USER   ssh user, also the boot service instance (default: nicknack)
 #
 # Image first (Raspberry Pi Imager): Raspberry Pi OS Bookworm 64-bit, hostname
-# nickpi, user nicknack, SSH on with your public key, Wi-Fi set. HAT on before
-# first boot. Then: ssh-keygen -R <host>, and ssh-copy-id if no key in Imager.
+# and user matching the above, SSH on with your public key, Wi-Fi set. HAT on
+# before first boot. Then: ssh-keygen -R <host>, and ssh-copy-id if no key in Imager.
 #
 # Idempotent: safe to re-run after a failed step. Makes no sound.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+export PI_HOST=${PI_HOST:-nickpi.local}
+export PI_USER=${PI_USER:-nicknack}
 PI="bash play_music_on_pi/pi.sh"
 MODEL=pi_optimize_demucs/models/student_final_slim.onnx
 STUBS=survey_separation/separators/htdemucs_distill/stubs
@@ -21,10 +27,10 @@ STUBS=survey_separation/separators/htdemucs_distill/stubs
 [[ -f $MODEL ]] || { echo "missing $MODEL (gitignored; restore from backup)"; exit 1; }
 
 # mDNS drops mid-run (the model transfer especially); resolve once, pin the IP.
-if [[ ${PI_HOST:-nickpi.local} == *.local ]]; then
+if [[ $PI_HOST == *.local ]]; then
     ip=$($PI "hostname -I" | awk '{print $1}')
-    [[ -n $ip ]] || { echo "can't reach ${PI_HOST:-nickpi.local}; pass PI_HOST=<ip>"; exit 1; }
-    export PI_HOST=$ip
+    [[ -n $ip ]] || { echo "can't reach $PI_HOST; pass PI_HOST=<ip>"; exit 1; }
+    PI_HOST=$ip
 fi
 echo "== using $PI_HOST"
 
@@ -61,8 +67,8 @@ $PI "cd ~ && [ -d da7212-config ] || { wget -q 'https://gitee.com/waveshare/DA72
   || echo "!! mixer step failed -- is the HAT detected? (aplay -l)"
 
 echo "== boot service (enabled, not started)"
-$PI "sudo cp ~/demucs_opt/separate/lappy-separate.service /etc/systemd/system/ \
-  && sudo systemctl daemon-reload && sudo systemctl enable lappy-separate"
+$PI "sudo cp ~/demucs_opt/separate/lappy-separate@.service /etc/systemd/system/ \
+  && sudo systemctl daemon-reload && sudo systemctl enable lappy-separate@\$USER"
 
 echo "== checks"
 $PI "tr -d '\0' < /proc/device-tree/hat/product; echo; aplay -l | grep -i zero || echo '!! no Zero card'; \
