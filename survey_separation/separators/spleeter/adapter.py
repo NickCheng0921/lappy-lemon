@@ -20,9 +20,9 @@ class SpleeterSeparator(Separator):
         self.python = python_bin
 
     def resolve(self, track, workdir):
-        # spleeter writes <out_root>/<mixture_stem>/{stem}.wav; every MUSDB
-        # mixture is "mixture.wav", so out_root must be per-track or they collide.
+        # track.id, since every mixture file shares the name "mixture.wav"
         out_root = Path(workdir) / self.name / track.id
+        # spleeter writes <out_root>/<mixture_stem>/{stem}.wav
         stem_dir = out_root / track.mixture.stem
         if not all((stem_dir / f"{s}.wav").exists() for s in CANONICAL):
             out_root.mkdir(parents=True, exist_ok=True)
