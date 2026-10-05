@@ -20,7 +20,8 @@ class SpleeterSeparator(Separator):
         self.python = python_bin
 
     def resolve(self, track, workdir):
-        out_root = Path(workdir) / self.name
+        # track.id, since every mixture file shares the name "mixture.wav"
+        out_root = Path(workdir) / self.name / track.id
         # spleeter writes <out_root>/<mixture_stem>/{stem}.wav
         stem_dir = out_root / track.mixture.stem
         if not all((stem_dir / f"{s}.wav").exists() for s in CANONICAL):

@@ -7,3 +7,6 @@ runs
 
 # Scratch drivers for running one separator at a time
 _run_*_tmp.py
+
+# Spleeter downloads weights into cwd
+pretrained_models
